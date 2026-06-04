@@ -50,6 +50,30 @@ def get_epub_work_paths(input_path: str, output_path: str):
     }
 
 
+def model_supports_language_tokens(model, tokenizer) -> bool:
+    return hasattr(tokenizer, "lang_code_to_id") or model.config.model_type in {
+        "m2m_100",
+    }
+
+
+def get_language_token_id(tokenizer, language: str):
+    if language is None:
+        return None
+    if hasattr(tokenizer, "lang_code_to_id"):
+        return tokenizer.lang_code_to_id.get(language)
+
+    token_id = tokenizer.convert_tokens_to_ids(language)
+    if token_id is None or token_id == tokenizer.unk_token_id:
+        return None
+    return token_id
+
+
+def describe_supported_languages(tokenizer):
+    if hasattr(tokenizer, "lang_code_to_id"):
+        return tokenizer.lang_code_to_id.keys()
+    return "language tokens in this tokenizer vocabulary"
+
+
 def get_dataloader(
     accelerator: Accelerator,
     filename: str,
@@ -175,7 +199,7 @@ def main(
         trust_remote_code=trust_remote_code,
     )
 
-    is_translation_model = hasattr(tokenizer, "lang_code_to_id")
+    is_translation_model = model_supports_language_tokens(model, tokenizer)
     lang_code_to_idx = None
 
     if (
@@ -186,7 +210,7 @@ def main(
         raise ValueError(
             f"The model you are using requires a source and target language. "
             f"Please specify them with --source-lang and --target-lang. "
-            f"The supported languages are: {tokenizer.lang_code_to_id.keys()}"
+            f"The supported languages are: {describe_supported_languages(tokenizer)}"
         )
     if not is_translation_model and (
         source_lang is not None or target_lang is not None
@@ -209,25 +233,29 @@ def main(
             f"Your prompt: {prompt}"
         )
 
-    if is_translation_model:
-        try:
-            _ = tokenizer.lang_code_to_id[source_lang]
-        except KeyError:
+    if is_translation_model and "small100" in model_name:
+        lang_code_to_idx = get_language_token_id(tokenizer, target_lang)
+        if lang_code_to_idx is None:
             raise KeyError(
-                f"Language {source_lang} not found in tokenizer. Available languages: {tokenizer.lang_code_to_id.keys()}"
+                f"Language {target_lang} not found in tokenizer. Available languages: {describe_supported_languages(tokenizer)}"
+            )
+        tokenizer.tgt_lang = target_lang
+        # We don't need to force the BOS token, so we set is_translation_model to False
+        is_translation_model = False
+
+    if is_translation_model:
+        source_lang_idx = get_language_token_id(tokenizer, source_lang)
+        if source_lang_idx is None:
+            raise KeyError(
+                f"Language {source_lang} not found in tokenizer. Available languages: {describe_supported_languages(tokenizer)}"
             )
         tokenizer.src_lang = source_lang
 
-        try:
-            lang_code_to_idx = tokenizer.lang_code_to_id[target_lang]
-        except KeyError:
+        lang_code_to_idx = get_language_token_id(tokenizer, target_lang)
+        if lang_code_to_idx is None:
             raise KeyError(
-                f"Language {target_lang} not found in tokenizer. Available languages: {tokenizer.lang_code_to_id.keys()}"
+                f"Language {target_lang} not found in tokenizer. Available languages: {describe_supported_languages(tokenizer)}"
             )
-        if "small100" in model_name:
-            tokenizer.tgt_lang = target_lang
-            # We don't need to force the BOS token, so we set is_translation_model to False
-            is_translation_model = False
 
     if model.config.model_type == "seamless_m4t":
         # Loading a seamless_m4t model, we need to set a few things to ensure compatibility
