@@ -2,6 +2,7 @@ import argparse
 import glob
 import math
 import os
+import shutil
 from typing import Optional
 
 import torch
@@ -14,11 +15,39 @@ from transformers import (
 )
 
 from dataset import DatasetReader, count_lines
+from epub_converter import epub_to_text, require_epub_dependencies, text_to_epub
 from model import load_model_for_inference
 
 
 def encode_string(text):
     return text.replace("\r", r"\r").replace("\n", r"\n").replace("\t", r"\t")
+
+
+def is_epub_path(path: Optional[str]) -> bool:
+    return path is not None and os.path.splitext(path)[1].lower() == ".epub"
+
+
+def directory_may_include_epubs(directory: Optional[str], files_extension: str) -> bool:
+    if directory is None:
+        return False
+    files_extension = files_extension or ""
+    if files_extension.lower() == "epub":
+        return True
+    if files_extension:
+        return False
+    return any(is_epub_path(path) for path in glob.glob(os.path.join(directory, "*")))
+
+
+def get_epub_work_paths(input_path: str, output_path: str):
+    work_dir = os.path.abspath(output_path) + ".easytranslate_epub"
+    return {
+        "work_dir": work_dir,
+        "source_text": os.path.join(work_dir, "source.txt"),
+        "translated_text": os.path.join(work_dir, "translated.txt"),
+        "manifest": os.path.join(work_dir, "manifest.json"),
+        "input_epub": input_path,
+        "output_path": output_path,
+    }
 
 
 def get_dataloader(
@@ -105,6 +134,17 @@ def main(
         raise ValueError(
             "You must specify either --sentences_path or --sentences_dir, not both. Use --help for more details."
         )
+
+    has_epub_input = is_epub_path(sentences_path) or directory_may_include_epubs(
+        sentences_dir, files_extension
+    )
+    if has_epub_input:
+        require_epub_dependencies()
+        if num_return_sequences != 1:
+            raise ValueError(
+                "EPUB input requires --num_return_sequences 1 so each extracted "
+                "book block maps to exactly one translated line."
+            )
 
     if precision is None:
         quantization = None
@@ -343,9 +383,53 @@ def main(
 
         print(f"Translation done. Output written to {output_path}\n")
 
+    def translate_file(input_path, final_output_path):
+        epub_work_paths = None
+        translation_input_path = input_path
+        translation_output_path = final_output_path
+
+        if is_epub_path(input_path):
+            epub_work_paths = get_epub_work_paths(input_path, final_output_path)
+            translation_input_path = epub_work_paths["source_text"]
+            if is_epub_path(final_output_path):
+                translation_output_path = epub_work_paths["translated_text"]
+
+            if accelerator.is_main_process:
+                if os.path.exists(epub_work_paths["work_dir"]):
+                    shutil.rmtree(epub_work_paths["work_dir"])
+                os.makedirs(epub_work_paths["work_dir"], exist_ok=True)
+                epub_to_text(
+                    epub_path=input_path,
+                    text_path=epub_work_paths["source_text"],
+                    manifest_path=epub_work_paths["manifest"],
+                )
+
+            accelerator.wait_for_everyone()
+
+        os.makedirs(os.path.abspath(os.path.dirname(final_output_path)), exist_ok=True)
+        inference(
+            sentences_path=translation_input_path,
+            output_path=translation_output_path,
+        )
+        accelerator.wait_for_everyone()
+
+        if epub_work_paths is not None and is_epub_path(final_output_path):
+            if accelerator.is_main_process:
+                text_to_epub(
+                    original_epub_path=epub_work_paths["input_epub"],
+                    translated_text_path=epub_work_paths["translated_text"],
+                    manifest_path=epub_work_paths["manifest"],
+                    output_epub_path=epub_work_paths["output_path"],
+                )
+                shutil.rmtree(epub_work_paths["work_dir"], ignore_errors=True)
+            accelerator.wait_for_everyone()
+        elif epub_work_paths is not None:
+            if accelerator.is_main_process:
+                shutil.rmtree(epub_work_paths["work_dir"], ignore_errors=True)
+            accelerator.wait_for_everyone()
+
     if sentences_path is not None:
-        os.makedirs(os.path.abspath(os.path.dirname(output_path)), exist_ok=True)
-        inference(sentences_path=sentences_path, output_path=output_path)
+        translate_file(sentences_path, output_path)
 
     if sentences_dir is not None:
         print(
@@ -358,7 +442,7 @@ def main(
             )
         ):
             output_filename = os.path.join(output_path, os.path.basename(filename))
-            inference(sentences_path=filename, output_path=output_filename)
+            translate_file(filename, output_filename)
 
     print("Translation done.\n")
 

@@ -123,6 +123,9 @@ pip install bitsandbytes
 
 PEFT (Optional, required for loading LoRA models)
 pip install peft
+
+EPUB support (Optional, required for translating .epub files directly)
+pip install ebooklib beautifulsoup4 lxml
 ```
 
 ## Translate a file
@@ -154,6 +157,21 @@ python3 translate.py \
 --target_lang es \
 --model_name facebook/m2m100_1.2B
 ```
+
+You can also pass an EPUB file directly. Easy-Translate will extract the book's
+text blocks, translate them with the same line-based pipeline, and rebuild a
+translated EPUB while preserving the original structure and assets.
+```bash
+python3 translate.py \
+--sentences_path book.epub \
+--output_path book.es.epub \
+--source_lang en \
+--target_lang es \
+--model_name facebook/m2m100_1.2B
+```
+
+If the EPUB output path ends in `.txt`, Easy-Translate writes one translated
+line per extracted EPUB block instead of rebuilding an EPUB.
 
 #### Multi-GPU
 
@@ -258,4 +276,3 @@ python3 eval.py \
 If you want to save the results to a file use the `--output_path` flag.
 
 See [sample_text/en2es.m2m100_1.2B.json](sample_text/en2es.m2m100_1.2B.json) for a sample output.
-
