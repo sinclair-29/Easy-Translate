@@ -7,12 +7,13 @@ from typing import Iterable, List
 try:
     import ebooklib
     import lxml
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, NavigableString
     from ebooklib import epub
 except ImportError:  # pragma: no cover - exercised through require_epub_dependencies
     ebooklib = None
     lxml = None
     BeautifulSoup = None
+    NavigableString = None
     epub = None
 
 
@@ -22,6 +23,8 @@ EPUB_DEPENDENCY_MESSAGE = (
 )
 
 BLOCK_TAGS = (
+    "article",
+    "aside",
     "h1",
     "h2",
     "h3",
@@ -31,7 +34,13 @@ BLOCK_TAGS = (
     "p",
     "li",
     "blockquote",
+    "div",
     "figcaption",
+    "main",
+    "pre",
+    "section",
+    "td",
+    "th",
     "caption",
     "dt",
     "dd",
@@ -39,6 +48,15 @@ BLOCK_TAGS = (
 
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？])\s+")
 MAX_TRANSLATION_UNIT_CHARS = 600
+EXCLUDED_TEXT_PARENTS = {
+    "head",
+    "link",
+    "meta",
+    "script",
+    "style",
+    "svg",
+    "title",
+}
 
 
 def require_epub_dependencies() -> None:
@@ -89,15 +107,35 @@ def split_translation_units(text: str) -> List[str]:
     return units
 
 
-def _is_document_item(item) -> bool:
-    return item is not None and item.get_type() == ebooklib.ITEM_DOCUMENT
+def _item_media_type(item) -> str:
+    media_type = getattr(item, "media_type", None)
+    if media_type is None and hasattr(item, "get_media_type"):
+        media_type = item.get_media_type()
+    return (media_type or "").lower()
 
 
-def _spine_document_items(book) -> Iterable:
+def _is_text_document_item(item) -> bool:
+    if item is None:
+        return False
+    item_name = (item.get_name() or "").lower()
+    media_type = _item_media_type(item)
+    return (
+        item.get_type() == ebooklib.ITEM_DOCUMENT
+        or item_name.endswith((".xhtml", ".html", ".htm"))
+        or media_type in {"application/xhtml+xml", "text/html"}
+    )
+
+
+def _document_items_in_reading_order(book) -> Iterable:
+    seen = set()
     for spine_item in book.spine:
         item_id = spine_item[0] if isinstance(spine_item, tuple) else spine_item
         item = book.get_item_with_id(item_id)
-        if _is_document_item(item):
+        if _is_text_document_item(item):
+            seen.add(item.get_id())
+            yield item
+    for item in book.get_items():
+        if _is_text_document_item(item) and item.get_id() not in seen:
             yield item
 
 
@@ -108,6 +146,22 @@ def _iter_translatable_blocks(soup: BeautifulSoup) -> Iterable:
         text = _normalize_text(block.get_text(" ", strip=True))
         if text:
             yield block
+
+
+def _iter_translatable_text_nodes(soup: BeautifulSoup) -> Iterable:
+    for node in soup.find_all(string=True):
+        if not isinstance(node, NavigableString):
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        if parent.name and parent.name.lower() in EXCLUDED_TEXT_PARENTS:
+            continue
+        if parent.find_parent(EXCLUDED_TEXT_PARENTS):
+            continue
+        text = _normalize_text(str(node))
+        if text:
+            yield node
 
 
 def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
@@ -121,19 +175,35 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
     }
     lines: List[str] = []
 
-    for item in _spine_document_items(book):
+    for item in _document_items_in_reading_order(book):
         content = item.get_content()
         soup = BeautifulSoup(content, "lxml")
         blocks = []
-        for block_index, block in enumerate(_iter_translatable_blocks(soup)):
-            text = _normalize_text(block.get_text(" ", strip=True))
+        candidates = list(_iter_translatable_blocks(soup))
+        visible_text = _normalize_text(soup.get_text(" ", strip=True))
+        candidate_text_length = sum(
+            len(_normalize_text(block.get_text(" ", strip=True)))
+            for block in candidates
+        )
+        extraction_mode = "blocks"
+        if visible_text and candidate_text_length < len(visible_text) * 0.8:
+            candidates = list(_iter_translatable_text_nodes(soup))
+            extraction_mode = "text_nodes"
+
+        for block_index, block in enumerate(candidates):
+            if extraction_mode == "text_nodes":
+                text = _normalize_text(str(block))
+                tag = block.parent.name if block.parent is not None else None
+            else:
+                text = _normalize_text(block.get_text(" ", strip=True))
+                tag = block.name
             text_lines = split_translation_units(text)
             blocks.append(
                 {
                     "line": len(lines),
                     "lines": len(text_lines),
                     "block_index": block_index,
-                    "tag": block.name,
+                    "tag": tag,
                     "original_text": text,
                 }
             )
@@ -144,6 +214,7 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
                 {
                     "item_id": item.get_id(),
                     "file_name": item.get_name(),
+                    "extraction_mode": extraction_mode,
                     "blocks": blocks,
                 }
             )
@@ -191,14 +262,18 @@ def text_to_epub(
 
     for manifest_item in manifest["items"]:
         item = book.get_item_with_id(manifest_item["item_id"])
-        if not _is_document_item(item):
+        if not _is_text_document_item(item):
             raise ValueError(
                 "EPUB manifest references a missing document item: "
                 f"{manifest_item['item_id']}"
             )
 
         soup = BeautifulSoup(item.get_content(), "lxml")
-        blocks = list(_iter_translatable_blocks(soup))
+        extraction_mode = manifest_item.get("extraction_mode", "blocks")
+        if extraction_mode == "text_nodes":
+            blocks = list(_iter_translatable_text_nodes(soup))
+        else:
+            blocks = list(_iter_translatable_blocks(soup))
         if len(blocks) != len(manifest_item["blocks"]):
             raise ValueError(
                 "EPUB structure changed while rebuilding "
@@ -209,8 +284,14 @@ def text_to_epub(
         for block, block_info in zip(blocks, manifest_item["blocks"]):
             line_start = block_info["line"]
             line_count = block_info.get("lines", 1)
-            block.clear()
-            block.append(" ".join(translated_lines[line_start : line_start + line_count]))
+            translated_text = " ".join(
+                translated_lines[line_start : line_start + line_count]
+            )
+            if extraction_mode == "text_nodes":
+                block.replace_with(translated_text)
+            else:
+                block.clear()
+                block.append(translated_text)
 
         item.set_content(str(soup).encode("utf-8"))
 

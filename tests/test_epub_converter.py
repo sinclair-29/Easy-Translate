@@ -59,6 +59,7 @@ class EpubConverter(unittest.TestCase):
         <body>
           <h1>Chapter One</h1>
           <p>First paragraph. Second sentence.</p>
+          <div class="plain">Div-only text. More div text.</div>
           <ul><li>Second item.</li></ul>
           <blockquote><p>Quoted line.</p></blockquote>
         </body></html>
@@ -109,6 +110,8 @@ class EpubConverter(unittest.TestCase):
                     "Chapter One",
                     "First paragraph.",
                     "Second sentence.",
+                    "Div-only text.",
+                    "More div text.",
                     "Second item.",
                     "Quoted line.",
                     "Chapter Two",
@@ -140,6 +143,8 @@ class EpubConverter(unittest.TestCase):
                     "Capitulo Uno",
                     "Primer parrafo.",
                     "Segunda frase.",
+                    "Texto de div.",
+                    "Mas texto de div.",
                     "Segundo elemento.",
                     "Linea citada.",
                     "Capitulo Dos",
@@ -162,6 +167,7 @@ class EpubConverter(unittest.TestCase):
             chapter = rebuilt.get_item_with_id("chapter-one").get_content().decode()
             self.assertIn("Capitulo Uno", chapter)
             self.assertIn("Primer parrafo. Segunda frase.", chapter)
+            self.assertIn("Texto de div. Mas texto de div.", chapter)
 
     def test_text_to_epub_rejects_line_count_mismatch(self):
         with tempfile.TemporaryDirectory() as tmpdirname:
