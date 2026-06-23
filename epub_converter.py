@@ -1,7 +1,11 @@
 import json
 import os
+import posixpath
 import re
-from typing import Iterable, List
+import tempfile
+import xml.etree.ElementTree as ET
+from typing import Dict, Iterable, List
+from zipfile import ZipFile
 
 
 try:
@@ -258,6 +262,90 @@ def _ensure_toc_uids(book) -> None:
     ensure_entry_uid(getattr(book, "toc", None))
 
 
+def _epub_root_dir(epub_path: str) -> str:
+    with ZipFile(epub_path) as epub_zip:
+        container = epub_zip.read("META-INF/container.xml")
+    root = ET.fromstring(container)
+    for element in root.iter():
+        if element.tag.endswith("rootfile"):
+            full_path = element.attrib.get("full-path", "")
+            return posixpath.dirname(full_path)
+    return ""
+
+
+def _zip_name_for_item(epub_zip: ZipFile, file_name: str, root_dir: str) -> str:
+    normalized_file_name = file_name.lstrip("/")
+    candidates = [normalized_file_name]
+    if root_dir:
+        candidates.append(posixpath.join(root_dir, normalized_file_name))
+
+    names = set(epub_zip.namelist())
+    for candidate in candidates:
+        if candidate in names:
+            return candidate
+
+    matches = [
+        name
+        for name in names
+        if name == normalized_file_name or name.endswith(f"/{normalized_file_name}")
+    ]
+    if len(matches) == 1:
+        return matches[0]
+
+    raise ValueError(f"Could not find EPUB item in package: {file_name}")
+
+
+def _write_epub_preserving_package(
+    original_epub_path: str,
+    output_epub_path: str,
+    replacements: Dict[str, bytes],
+) -> None:
+    output_dir = os.path.abspath(os.path.dirname(output_epub_path))
+    os.makedirs(output_dir, exist_ok=True)
+
+    final_output_path = os.path.abspath(output_epub_path)
+    source_path = os.path.abspath(original_epub_path)
+    if final_output_path == source_path:
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix=".easytranslate-",
+            suffix=".epub",
+            dir=output_dir,
+            delete=False,
+        )
+        temp_file.close()
+        write_path = temp_file.name
+    else:
+        write_path = final_output_path
+
+    try:
+        with ZipFile(original_epub_path, "r") as source_zip:
+            infos = source_zip.infolist()
+            mimetype_info = next(
+                (info for info in infos if info.filename == "mimetype"),
+                None,
+            )
+            ordered_infos = []
+            if mimetype_info is not None:
+                ordered_infos.append(mimetype_info)
+            ordered_infos.extend(
+                info for info in infos if info.filename != "mimetype"
+            )
+
+            with ZipFile(write_path, "w") as output_zip:
+                for info in ordered_infos:
+                    content = replacements.get(
+                        info.filename,
+                        source_zip.read(info.filename),
+                    )
+                    output_zip.writestr(info, content)
+        if write_path != final_output_path:
+            os.replace(write_path, final_output_path)
+    except Exception:
+        if write_path != final_output_path and os.path.exists(write_path):
+            os.unlink(write_path)
+        raise
+
+
 def text_to_epub(
     original_epub_path: str,
     translated_text_path: str,
@@ -267,7 +355,6 @@ def text_to_epub(
     """Rebuild an EPUB by replacing extracted blocks with translated lines."""
     require_epub_dependencies()
 
-    book = epub.read_epub(original_epub_path)
     translated_lines = _load_translated_lines(translated_text_path)
     with open(manifest_path, "r", encoding="utf-8") as manifest_file:
         manifest = json.load(manifest_file)
@@ -282,41 +369,44 @@ def text_to_epub(
             f"expected {expected_lines}, found {len(translated_lines)}"
         )
 
-    for manifest_item in manifest["items"]:
-        item = book.get_item_with_id(manifest_item["item_id"])
-        if not _is_text_document_item(item):
-            raise ValueError(
-                "EPUB manifest references a missing document item: "
-                f"{manifest_item['item_id']}"
+    root_dir = _epub_root_dir(original_epub_path)
+    replacements: Dict[str, bytes] = {}
+    with ZipFile(original_epub_path) as epub_zip:
+        for manifest_item in manifest["items"]:
+            zip_name = _zip_name_for_item(
+                epub_zip,
+                manifest_item["file_name"],
+                root_dir,
             )
-
-        soup = BeautifulSoup(item.get_content(), "lxml")
-        extraction_mode = manifest_item.get("extraction_mode", "blocks")
-        if extraction_mode == "text_nodes":
-            blocks = list(_iter_translatable_text_nodes(soup))
-        else:
-            blocks = list(_iter_translatable_blocks(soup))
-        if len(blocks) != len(manifest_item["blocks"]):
-            raise ValueError(
-                "EPUB structure changed while rebuilding "
-                f"{manifest_item['file_name']}: expected "
-                f"{len(manifest_item['blocks'])} blocks, found {len(blocks)}"
-            )
-
-        for block, block_info in zip(blocks, manifest_item["blocks"]):
-            line_start = block_info["line"]
-            line_count = block_info.get("lines", 1)
-            translated_text = " ".join(
-                translated_lines[line_start : line_start + line_count]
-            )
+            soup = BeautifulSoup(epub_zip.read(zip_name), "lxml")
+            extraction_mode = manifest_item.get("extraction_mode", "blocks")
             if extraction_mode == "text_nodes":
-                block.replace_with(translated_text)
+                blocks = list(_iter_translatable_text_nodes(soup))
             else:
-                block.clear()
-                block.append(translated_text)
+                blocks = list(_iter_translatable_blocks(soup))
+            if len(blocks) != len(manifest_item["blocks"]):
+                raise ValueError(
+                    "EPUB structure changed while rebuilding "
+                    f"{manifest_item['file_name']}: expected "
+                    f"{len(manifest_item['blocks'])} blocks, found {len(blocks)}"
+                )
 
-        item.set_content(str(soup).encode("utf-8"))
+            for block, block_info in zip(blocks, manifest_item["blocks"]):
+                line_start = block_info["line"]
+                line_count = block_info.get("lines", 1)
+                translated_text = " ".join(
+                    translated_lines[line_start : line_start + line_count]
+                )
+                if extraction_mode == "text_nodes":
+                    block.replace_with(translated_text)
+                else:
+                    block.clear()
+                    block.append(translated_text)
 
-    os.makedirs(os.path.abspath(os.path.dirname(output_epub_path)), exist_ok=True)
-    _ensure_toc_uids(book)
-    epub.write_epub(output_epub_path, book)
+            replacements[zip_name] = str(soup).encode("utf-8")
+
+    _write_epub_preserving_package(
+        original_epub_path,
+        output_epub_path,
+        replacements,
+    )

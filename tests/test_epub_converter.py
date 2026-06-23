@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from unittest import mock
+from zipfile import ZipFile
 
 import epub_converter
 
@@ -190,6 +191,16 @@ class EpubConverter(unittest.TestCase):
             self.assertIn("Capitulo Uno", chapter)
             self.assertIn("Primer parrafo. Segunda frase.", chapter)
             self.assertIn("Texto de div. Mas texto de div.", chapter)
+
+            with ZipFile(output_epub_path) as output_zip:
+                chapter_path = next(
+                    name
+                    for name in output_zip.namelist()
+                    if name.endswith("chapter1.xhtml")
+                )
+                raw_chapter = output_zip.read(chapter_path).decode()
+            self.assertIn("<title>Chapter One</title>", raw_chapter)
+            self.assertIn('href="style/book.css"', raw_chapter)
 
     def test_text_to_epub_rejects_line_count_mismatch(self):
         with tempfile.TemporaryDirectory() as tmpdirname:
