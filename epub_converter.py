@@ -61,6 +61,17 @@ EXCLUDED_TEXT_PARENTS = {
     "svg",
     "title",
 }
+LINK_PRESERVING_TAGS = {
+    "a",
+    "audio",
+    "embed",
+    "iframe",
+    "img",
+    "object",
+    "source",
+    "track",
+    "video",
+}
 
 
 def require_epub_dependencies() -> None:
@@ -166,6 +177,31 @@ def _iter_translatable_text_nodes(soup: BeautifulSoup) -> Iterable:
         text = _normalize_text(str(node))
         if text:
             yield node
+
+
+def _has_linked_descendant(block) -> bool:
+    return bool(block.find(LINK_PRESERVING_TAGS))
+
+
+def _replace_block_text_preserving_links(block, translated_text: str) -> None:
+    first_text_node = None
+    for node in block.find_all(string=True):
+        if not isinstance(node, NavigableString):
+            continue
+        parent = node.parent
+        if parent is not None and parent.name in LINK_PRESERVING_TAGS:
+            continue
+        if not _normalize_text(str(node)):
+            continue
+        if first_text_node is None:
+            first_text_node = node
+        else:
+            node.replace_with("")
+
+    if first_text_node is not None:
+        first_text_node.replace_with(translated_text)
+    else:
+        block.insert(0, translated_text)
 
 
 def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
@@ -399,6 +435,8 @@ def text_to_epub(
                 )
                 if extraction_mode == "text_nodes":
                     block.replace_with(translated_text)
+                elif _has_linked_descendant(block):
+                    _replace_block_text_preserving_links(block, translated_text)
                 else:
                     block.clear()
                     block.append(translated_text)

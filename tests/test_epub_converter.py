@@ -43,6 +43,25 @@ class TocUidNormalization(unittest.TestCase):
         self.assertEqual(second.children[0].uid, "toc-2")
 
 
+@unittest.skipIf(epub_converter.BeautifulSoup is None, "BeautifulSoup is not installed")
+class LinkPreservingReplacement(unittest.TestCase):
+    def test_block_replacement_keeps_anchor_href(self):
+        soup = epub_converter.BeautifulSoup(
+            '<p>This paragraph has <a href="chapter2.xhtml">link text</a>.</p>',
+            "html.parser",
+        )
+        block = soup.find("p")
+
+        epub_converter._replace_block_text_preserving_links(
+            block,
+            "这个段落包含一个链接。",
+        )
+
+        self.assertIn("这个段落包含一个链接。", str(block))
+        self.assertIn('href="chapter2.xhtml"', str(block))
+        self.assertIn("<a", str(block))
+
+
 @unittest.skipUnless(HAS_EPUB_DEPS, "EPUB dependencies are not installed")
 class EpubConverter(unittest.TestCase):
     def create_book(self, path):

@@ -127,3 +127,6 @@ dmypy.json
 .idea/
 
 debug/
+
+.DS_Store
+toy_zh.epub
