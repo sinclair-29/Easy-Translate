@@ -193,6 +193,33 @@ def render_chat_prompt(tokenizer, prompt_text: str) -> str:
     return f"{DEFAULT_LLM_SYSTEM_PROMPT}\n\n{prompt_text}"
 
 
+def apply_chat_template_tokenized(tokenizer, prompt_text: str):
+    messages = build_chat_messages(prompt_text)
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(apply_chat_template) or not getattr(tokenizer, "chat_template", None):
+        return None
+
+    try:
+        return apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            return_tensors="pt",
+        )
+    except TypeError:
+        return apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+
+
+def build_plain_prompt(tokenizer, prompt_text: str) -> str:
+    return render_chat_prompt(tokenizer, prompt_text)
+
+
 def make_translation_groups(
     lines: List[str],
     merge_small_blocks: bool,

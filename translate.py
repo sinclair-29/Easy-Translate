@@ -17,14 +17,15 @@ from transformers import (
 from dataset import DatasetReader, count_lines
 from epub_converter import epub_to_text, require_epub_dependencies, text_to_epub
 from llm_translation import (
+    apply_chat_template_tokenized,
     build_context,
     build_llm_prompt,
     build_numbered_text,
+    build_plain_prompt,
     is_llm_translation_model,
     make_translation_groups,
     parse_numbered_translations,
     read_text_lines,
-    render_chat_prompt,
     split_text_for_llm,
 )
 from model import load_model_for_inference
@@ -358,6 +359,17 @@ def main(
     if repetition_penalty is not None:
         gen_kwargs["repetition_penalty"] = repetition_penalty
 
+    if is_llm_translation:
+        stop_token_ids = []
+        for token in ("<|im_end|>", "<|endoftext|>"):
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None and token_id != tokenizer.unk_token_id:
+                stop_token_ids.append(token_id)
+        if stop_token_ids:
+            gen_kwargs["eos_token_id"] = stop_token_ids
+        if tokenizer.pad_token_id is not None:
+            gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+
     if is_translation_model:
         gen_kwargs["forced_bos_token_id"] = lang_code_to_idx
 
@@ -499,17 +511,35 @@ def main(
         translations = [None] * len(source_lines)
         prepared_model = accelerator.prepare(model)
 
-        def generate_prompts(prompt_texts):
-            rendered_prompts = [
-                render_chat_prompt(tokenizer, prompt_text) for prompt_text in prompt_texts
+        def build_llm_batch(prompt_texts):
+            tokenized_prompts = [
+                apply_chat_template_tokenized(tokenizer, prompt_text)
+                for prompt_text in prompt_texts
             ]
-            batch = tokenizer(
+            if all(prompt is not None for prompt in tokenized_prompts):
+                encoded_prompts = [
+                    prompt.squeeze(0).tolist() if hasattr(prompt, "squeeze") else prompt
+                    for prompt in tokenized_prompts
+                ]
+                return tokenizer.pad(
+                    {"input_ids": encoded_prompts},
+                    padding=True,
+                    return_tensors="pt",
+                )
+
+            rendered_prompts = [
+                build_plain_prompt(tokenizer, prompt_text) for prompt_text in prompt_texts
+            ]
+            return tokenizer(
                 rendered_prompts,
                 padding=True,
                 truncation=True,
                 max_length=llm_input_max_length,
                 return_tensors="pt",
             )
+
+        def generate_prompts(prompt_texts):
+            batch = build_llm_batch(prompt_texts)
             batch = {key: value.to(accelerator.device) for key, value in batch.items()}
             generated_tokens = accelerator.unwrap_model(prepared_model).generate(
                 **batch,

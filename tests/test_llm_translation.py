@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from llm_translation import (
+    apply_chat_template_tokenized,
     build_context,
     build_llm_prompt,
     build_numbered_text,
@@ -21,6 +22,18 @@ class FakeTokenizer:
         self.tokenize = tokenize
         self.add_generation_prompt = add_generation_prompt
         return "CHAT:" + messages[-1]["content"]
+
+
+class FakeTokenizedTokenizer:
+    chat_template = "{messages}"
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, return_tensors, enable_thinking=False):
+        self.messages = messages
+        self.tokenize = tokenize
+        self.add_generation_prompt = add_generation_prompt
+        self.return_tensors = return_tensors
+        self.enable_thinking = enable_thinking
+        return [[1, 2, 3]]
 
 
 class LlmTranslationHelpers(unittest.TestCase):
@@ -90,6 +103,16 @@ class LlmTranslationHelpers(unittest.TestCase):
         self.assertFalse(tokenizer.tokenize)
         self.assertTrue(tokenizer.add_generation_prompt)
         self.assertEqual(tokenizer.messages[0]["role"], "system")
+
+    def test_tokenized_chat_template_disables_thinking_when_supported(self):
+        tokenizer = FakeTokenizedTokenizer()
+        tokenized = apply_chat_template_tokenized(tokenizer, "Translate this.")
+
+        self.assertEqual(tokenized, [[1, 2, 3]])
+        self.assertTrue(tokenizer.tokenize)
+        self.assertTrue(tokenizer.add_generation_prompt)
+        self.assertEqual(tokenizer.return_tensors, "pt")
+        self.assertFalse(tokenizer.enable_thinking)
 
     def test_context_formatting_excludes_current_block(self):
         lines = ["zero", "one", "two", "three", "four"]
