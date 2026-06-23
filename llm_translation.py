@@ -112,6 +112,34 @@ def build_numbered_text(texts: Iterable[str]) -> str:
     return "\n".join(f"[{index}] {text}" for index, text in enumerate(texts, start=1))
 
 
+def split_text_for_llm(text: str, max_chars: int) -> List[str]:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    remaining = text.strip()
+    while len(remaining) > max_chars:
+        split_at = -1
+        separator_length = 0
+        for separator in ("\n", ". ", "? ", "! ", "; ", ", ", " "):
+            candidate = remaining.rfind(separator, 0, max_chars)
+            if candidate >= max_chars // 3:
+                split_at = candidate
+                separator_length = len(separator.rstrip() or separator)
+                break
+        if split_at < max_chars // 3:
+            split_at = max_chars
+            separator_length = 0
+        chunk = remaining[: split_at + separator_length].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at + separator_length :].strip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks or [text]
+
+
 def build_llm_prompt(
     text: str,
     target_language: str,
@@ -149,11 +177,19 @@ def render_chat_prompt(tokenizer, prompt_text: str) -> str:
     messages = build_chat_messages(prompt_text)
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
     if callable(apply_chat_template) and getattr(tokenizer, "chat_template", None):
-        return apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        try:
+            return apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
     return f"{DEFAULT_LLM_SYSTEM_PROMPT}\n\n{prompt_text}"
 
 

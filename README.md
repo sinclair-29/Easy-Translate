@@ -253,6 +253,8 @@ python3 translate.py \
 --precision fp16 \
 --context_window 1 \
 --merge_small_blocks \
+--llm_input_max_length 8192 \
+--llm_chunk_chars 3000 \
 --max_length 2048
 ```
 
@@ -275,6 +277,10 @@ python3 translate.py \
 it to return only the current block's translation. `--merge_small_blocks` groups
 neighboring short blocks as numbered items, then maps the numbered translations
 back to the original line/block count so EPUB reconstruction remains compatible.
+For very large EPUB blocks, `--llm_chunk_chars` splits a source block into
+smaller numbered chunks and joins the translated chunks back into the original
+output line. `--llm_input_max_length` controls the tokenized prompt length,
+while `--max_length` controls generated tokens.
 
 
 ### Decoding/Sampling strategies

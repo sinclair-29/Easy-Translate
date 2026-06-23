@@ -25,6 +25,7 @@ from llm_translation import (
     parse_numbered_translations,
     read_text_lines,
     render_chat_prompt,
+    split_text_for_llm,
 )
 from model import load_model_for_inference
 
@@ -153,6 +154,8 @@ def main(
     context_window: int = 0,
     merge_small_blocks: bool = False,
     merge_max_chars: int = 1200,
+    llm_input_max_length: int = 8192,
+    llm_chunk_chars: int = 3000,
 ):
     accelerator = Accelerator()
 
@@ -279,6 +282,10 @@ def main(
         raise ValueError("--context_window must be greater than or equal to 0.")
     if merge_max_chars <= 0:
         raise ValueError("--merge_max_chars must be greater than 0.")
+    if llm_input_max_length <= 0:
+        raise ValueError("--llm_input_max_length must be greater than 0.")
+    if llm_chunk_chars <= 0:
+        raise ValueError("--llm_chunk_chars must be greater than 0.")
 
     if is_translation_model and "small100" in model_name:
         lang_code_to_idx = get_language_token_id(tokenizer, target_lang)
@@ -369,6 +376,8 @@ def main(
             f"LLM target language: {llm_target_language}\n"
             f"Context window: {context_window}\n"
             f"Merge small blocks: {merge_small_blocks}\n"
+            f"LLM input max length: {llm_input_max_length}\n"
+            f"LLM chunk chars: {llm_chunk_chars}\n"
             f"Force target lang as BOS token: {is_translation_model}\n"
             f"Prompt: {prompt}\n"
             f"Starting batch size: {starting_batch_size}\n"
@@ -498,7 +507,7 @@ def main(
                 rendered_prompts,
                 padding=True,
                 truncation=True,
-                max_length=max_length,
+                max_length=llm_input_max_length,
                 return_tensors="pt",
             )
             batch = {key: value.to(accelerator.device) for key, value in batch.items()}
@@ -520,16 +529,50 @@ def main(
                 end_index=group[-1],
                 window=context_window,
             )
-            if len(group) == 1:
-                text = source_lines[group[0]]
-            else:
-                text = build_numbered_text(source_lines[index] for index in group)
+            text = build_numbered_text(source_lines[index] for index in group)
             return build_llm_prompt(
                 text=text,
                 target_language=llm_target_language,
                 context=context,
                 prompt_template=llm_prompt,
             )
+
+        def translate_single_line(index):
+            chunks = split_text_for_llm(source_lines[index], llm_chunk_chars)
+            prompt_text = build_llm_prompt(
+                text=build_numbered_text(chunks),
+                target_language=llm_target_language,
+                context=build_context(
+                    source_lines,
+                    start_index=index,
+                    end_index=index,
+                    window=context_window,
+                ),
+                prompt_template=llm_prompt,
+            )
+            decoded_output = generate_prompts([prompt_text])[0]
+            try:
+                translated_chunks = parse_numbered_translations(
+                    decoded_output,
+                    expected_count=len(chunks),
+                )
+            except ValueError:
+                if len(chunks) == 1:
+                    translated_chunks = [decoded_output.strip()]
+                else:
+                    fallback_prompts = [
+                        build_llm_prompt(
+                            text=chunk,
+                            target_language=llm_target_language,
+                            context="",
+                            prompt_template=llm_prompt,
+                        )
+                        for chunk in chunks
+                    ]
+                    translated_chunks = [
+                        output.strip() for output in generate_prompts(fallback_prompts)
+                    ]
+            return " ".join(chunk.strip() for chunk in translated_chunks if chunk.strip())
 
         with tqdm(
             total=len(source_lines),
@@ -545,7 +588,14 @@ def main(
 
                     for group, decoded_output in zip(batch_groups, decoded_outputs):
                         if len(group) == 1:
-                            translations[group[0]] = decoded_output.strip()
+                            try:
+                                parsed_outputs = parse_numbered_translations(
+                                    decoded_output,
+                                    expected_count=1,
+                                )
+                                translations[group[0]] = parsed_outputs[0].strip()
+                            except ValueError:
+                                translations[group[0]] = translate_single_line(group[0])
                             pbar.update(1)
                             continue
 
@@ -555,22 +605,8 @@ def main(
                                 expected_count=len(group),
                             )
                         except ValueError:
-                            fallback_prompts = [
-                                build_llm_prompt(
-                                    text=source_lines[index],
-                                    target_language=llm_target_language,
-                                    context=build_context(
-                                        source_lines,
-                                        start_index=index,
-                                        end_index=index,
-                                        window=context_window,
-                                    ),
-                                    prompt_template=llm_prompt,
-                                )
-                                for index in group
-                            ]
                             parsed_outputs = [
-                                output.strip() for output in generate_prompts(fallback_prompts)
+                                translate_single_line(index) for index in group
                             ]
 
                         for index, translated_text in zip(group, parsed_outputs):
@@ -862,6 +898,21 @@ if __name__ == "__main__":
         help="Maximum total characters per merged short-block group in LLM translation mode.",
     )
 
+    parser.add_argument(
+        "--llm_input_max_length",
+        type=int,
+        default=8192,
+        help="Maximum tokenized input prompt length for LLM translation mode. "
+        "This is separate from --max_length, which controls generated tokens.",
+    )
+
+    parser.add_argument(
+        "--llm_chunk_chars",
+        type=int,
+        default=3000,
+        help="Split oversized source blocks into chunks of about this many characters before LLM translation.",
+    )
+
     args = parser.parse_args()
 
     main(
@@ -891,4 +942,6 @@ if __name__ == "__main__":
         context_window=args.context_window,
         merge_small_blocks=args.merge_small_blocks,
         merge_max_chars=args.merge_max_chars,
+        llm_input_max_length=args.llm_input_max_length,
+        llm_chunk_chars=args.llm_chunk_chars,
     )

@@ -9,6 +9,7 @@ from llm_translation import (
     make_translation_groups,
     parse_numbered_translations,
     render_chat_prompt,
+    split_text_for_llm,
 )
 
 
@@ -140,6 +141,17 @@ class LlmTranslationHelpers(unittest.TestCase):
     def test_numbered_parse_rejects_missing_items(self):
         with self.assertRaisesRegex(ValueError, "Expected 2"):
             parse_numbered_translations("[1] 阿尔法。", expected_count=2)
+
+    def test_split_text_for_llm_prefers_sentence_boundaries(self):
+        chunks = split_text_for_llm(
+            "First sentence. Second sentence. Third sentence.",
+            max_chars=30,
+        )
+
+        self.assertEqual(chunks, ["First sentence.", "Second sentence.", "Third sentence."])
+
+    def test_split_text_for_llm_keeps_short_text_unchanged(self):
+        self.assertEqual(split_text_for_llm("short text", max_chars=30), ["short text"])
 
 
 if __name__ == "__main__":
