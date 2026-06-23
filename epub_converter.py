@@ -236,6 +236,28 @@ def _load_translated_lines(translated_text_path: str) -> List[str]:
         return [line.rstrip("\n") for line in translated_file]
 
 
+def _ensure_toc_uids(book) -> None:
+    """ebooklib cannot write NCX entries whose TOC uid is None."""
+    counter = 0
+
+    def ensure_entry_uid(entry) -> None:
+        nonlocal counter
+        if isinstance(entry, (list, tuple)):
+            for child in entry:
+                ensure_entry_uid(child)
+            return
+
+        if hasattr(entry, "uid") and not getattr(entry, "uid", None):
+            counter += 1
+            entry.uid = f"toc-{counter}"
+
+        children = getattr(entry, "children", None)
+        if children:
+            ensure_entry_uid(children)
+
+    ensure_entry_uid(getattr(book, "toc", None))
+
+
 def text_to_epub(
     original_epub_path: str,
     translated_text_path: str,
@@ -296,4 +318,5 @@ def text_to_epub(
         item.set_content(str(soup).encode("utf-8"))
 
     os.makedirs(os.path.abspath(os.path.dirname(output_epub_path)), exist_ok=True)
+    _ensure_toc_uids(book)
     epub.write_epub(output_epub_path, book)

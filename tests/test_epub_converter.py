@@ -20,6 +20,28 @@ class EpubDependencyErrors(unittest.TestCase):
                 epub_converter.require_epub_dependencies()
 
 
+class TocUidNormalization(unittest.TestCase):
+    def test_missing_nested_toc_uids_get_stable_fallbacks(self):
+        class TocEntry:
+            def __init__(self, uid=None, children=None):
+                self.uid = uid
+                self.children = children or []
+
+        class Book:
+            pass
+
+        book = Book()
+        first = TocEntry()
+        second = TocEntry("existing-id", children=[TocEntry()])
+        book.toc = (first, ("Section", [second]))
+
+        epub_converter._ensure_toc_uids(book)
+
+        self.assertEqual(first.uid, "toc-1")
+        self.assertEqual(second.uid, "existing-id")
+        self.assertEqual(second.children[0].uid, "toc-2")
+
+
 @unittest.skipUnless(HAS_EPUB_DEPS, "EPUB dependencies are not installed")
 class EpubConverter(unittest.TestCase):
     def create_book(self, path):
