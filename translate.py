@@ -519,7 +519,7 @@ def main(
             if all(prompt is not None for prompt in tokenized_prompts):
                 encoded_prompts = []
                 for prompt in tokenized_prompts:
-                    if isinstance(prompt, dict):
+                    if hasattr(prompt, "keys") and "input_ids" in prompt:
                         prompt = prompt["input_ids"]
                     if hasattr(prompt, "squeeze"):
                         prompt = prompt.squeeze(0)
