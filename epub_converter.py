@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Iterable, List
 
 
@@ -36,6 +37,9 @@ BLOCK_TAGS = (
     "dd",
 )
 
+SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？])\s+")
+MAX_TRANSLATION_UNIT_CHARS = 600
+
 
 def require_epub_dependencies() -> None:
     if ebooklib is None or lxml is None or BeautifulSoup is None or epub is None:
@@ -44,6 +48,45 @@ def require_epub_dependencies() -> None:
 
 def _normalize_text(text: str) -> str:
     return " ".join(text.split())
+
+
+def _split_long_text(text: str, max_chars: int) -> List[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    remaining = text
+    while len(remaining) > max_chars:
+        split_at = max(
+            remaining.rfind("; ", 0, max_chars),
+            remaining.rfind(", ", 0, max_chars),
+            remaining.rfind(" ", 0, max_chars),
+        )
+        if split_at < max_chars // 2:
+            split_at = max_chars
+        chunk = remaining[:split_at].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def split_translation_units(text: str) -> List[str]:
+    sentences = [
+        sentence.strip()
+        for sentence in SENTENCE_BOUNDARY.split(text)
+        if sentence.strip()
+    ]
+    if not sentences:
+        return []
+
+    units = []
+    for sentence in sentences:
+        units.extend(_split_long_text(sentence, MAX_TRANSLATION_UNIT_CHARS))
+    return units
 
 
 def _is_document_item(item) -> bool:
@@ -84,15 +127,17 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
         blocks = []
         for block_index, block in enumerate(_iter_translatable_blocks(soup)):
             text = _normalize_text(block.get_text(" ", strip=True))
+            text_lines = split_translation_units(text)
             blocks.append(
                 {
                     "line": len(lines),
+                    "lines": len(text_lines),
                     "block_index": block_index,
                     "tag": block.name,
                     "original_text": text,
                 }
             )
-            lines.append(text)
+            lines.extend(text_lines)
 
         if blocks:
             manifest["items"].append(
@@ -134,7 +179,10 @@ def text_to_epub(
     with open(manifest_path, "r", encoding="utf-8") as manifest_file:
         manifest = json.load(manifest_file)
 
-    expected_lines = sum(len(item["blocks"]) for item in manifest["items"])
+    expected_lines = sum(
+        sum(block.get("lines", 1) for block in item["blocks"])
+        for item in manifest["items"]
+    )
     if len(translated_lines) != expected_lines:
         raise ValueError(
             "Translated text line count does not match EPUB manifest: "
@@ -159,8 +207,10 @@ def text_to_epub(
             )
 
         for block, block_info in zip(blocks, manifest_item["blocks"]):
+            line_start = block_info["line"]
+            line_count = block_info.get("lines", 1)
             block.clear()
-            block.append(translated_lines[block_info["line"]])
+            block.append(" ".join(translated_lines[line_start : line_start + line_count]))
 
         item.set_content(str(soup).encode("utf-8"))
 
