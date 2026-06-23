@@ -16,6 +16,16 @@ from transformers import (
 
 from dataset import DatasetReader, count_lines
 from epub_converter import epub_to_text, require_epub_dependencies, text_to_epub
+from llm_translation import (
+    build_context,
+    build_llm_prompt,
+    build_numbered_text,
+    is_llm_translation_model,
+    make_translation_groups,
+    parse_numbered_translations,
+    read_text_lines,
+    render_chat_prompt,
+)
 from model import load_model_for_inference
 
 
@@ -121,33 +131,30 @@ def main(
     output_path: str,
     source_lang: Optional[str],
     target_lang: Optional[str],
-    starting_batch_size: int,
+    starting_batch_size: Optional[int] = None,
     model_name: str = "facebook/m2m100_1.2B",
     lora_weights_name_or_path: str = None,
     force_auto_device_map: bool = False,
     precision: str = None,
-    max_length: int = 256,
-    num_beams: int = 4,
+    max_length: Optional[int] = None,
+    num_beams: Optional[int] = None,
     num_return_sequences: int = 1,
     do_sample: bool = False,
-    temperature: float = 1.0,
-    top_k: int = 50,
-    top_p: float = 1.0,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
     keep_special_tokens: bool = False,
     keep_tokenization_spaces: bool = False,
     repetition_penalty: float = None,
     prompt: str = None,
     trust_remote_code: bool = False,
+    llm_target_language: str = "Simplified Chinese",
+    llm_prompt: str = None,
+    context_window: int = 0,
+    merge_small_blocks: bool = False,
+    merge_max_chars: int = 1200,
 ):
     accelerator = Accelerator()
-
-    if force_auto_device_map and starting_batch_size >= 64:
-        print(
-            f"WARNING: You are using a very large batch size ({starting_batch_size}) and the auto_device_map  flag. "
-            f"auto_device_map will offload model parameters to the CPU when they don't fit on the GPU VRAM. "
-            f"If you use a very large batch size, it will offload a lot of parameters to the CPU and slow down the "
-            f"inference. You should consider using a smaller batch size, i.e '--starting_batch_size 8'"
-        )
 
     if sentences_path is None and sentences_dir is None:
         raise ValueError(
@@ -199,7 +206,41 @@ def main(
         trust_remote_code=trust_remote_code,
     )
 
-    is_translation_model = model_supports_language_tokens(model, tokenizer)
+    is_llm_translation = is_llm_translation_model(model, tokenizer, model_name)
+    if max_length is None:
+        max_length = 2048 if is_llm_translation else 256
+    if num_beams is None:
+        num_beams = 1 if is_llm_translation else 5
+    if starting_batch_size is None:
+        starting_batch_size = 1 if is_llm_translation else 128
+    if temperature is None and not is_llm_translation:
+        temperature = 0.8
+    if top_k is None and not is_llm_translation:
+        top_k = 100
+    if top_p is None and not is_llm_translation:
+        top_p = 0.75
+
+    if starting_batch_size <= 0:
+        raise ValueError("--starting_batch_size must be greater than 0.")
+    if max_length <= 0:
+        raise ValueError("--max_length must be greater than 0.")
+    if num_beams <= 0:
+        raise ValueError("--num_beams must be greater than 0.")
+
+    if force_auto_device_map and starting_batch_size >= 64:
+        print(
+            f"WARNING: You are using a very large batch size ({starting_batch_size}) and the auto_device_map  flag. "
+            f"auto_device_map will offload model parameters to the CPU when they don't fit on the GPU VRAM. "
+            f"If you use a very large batch size, it will offload a lot of parameters to the CPU and slow down the "
+            f"inference. You should consider using a smaller batch size, i.e '--starting_batch_size 8'"
+        )
+
+    if is_llm_translation and num_return_sequences != 1:
+        raise ValueError("LLM translation mode requires --num_return_sequences 1.")
+
+    is_translation_model = (
+        False if is_llm_translation else model_supports_language_tokens(model, tokenizer)
+    )
     lang_code_to_idx = None
 
     if (
@@ -212,7 +253,7 @@ def main(
             f"Please specify them with --source-lang and --target-lang. "
             f"The supported languages are: {describe_supported_languages(tokenizer)}"
         )
-    if not is_translation_model and (
+    if not is_llm_translation and not is_translation_model and (
         source_lang is not None or target_lang is not None
     ):
         if prompt is None:
@@ -232,6 +273,12 @@ def main(
             f"The prompt must contain the %%SENTENCE%% token to indicate where the sentence should be inserted. "
             f"Your prompt: {prompt}"
         )
+    if llm_prompt is not None and "{TEXT}" not in llm_prompt:
+        raise ValueError("The --llm_prompt argument must include the {TEXT} placeholder.")
+    if context_window < 0:
+        raise ValueError("--context_window must be greater than or equal to 0.")
+    if merge_max_chars <= 0:
+        raise ValueError("--merge_max_chars must be greater than 0.")
 
     if is_translation_model and "small100" in model_name:
         lang_code_to_idx = get_language_token_id(tokenizer, target_lang)
@@ -286,10 +333,20 @@ def main(
         "num_beams": num_beams,
         "num_return_sequences": num_return_sequences,
         "do_sample": do_sample,
-        "temperature": temperature,
-        "top_k": top_k,
-        "top_p": top_p,
     }
+
+    if is_llm_translation:
+        if do_sample:
+            if temperature is not None:
+                gen_kwargs["temperature"] = temperature
+            if top_k is not None:
+                gen_kwargs["top_k"] = top_k
+            if top_p is not None:
+                gen_kwargs["top_p"] = top_p
+    else:
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_k"] = top_k
+        gen_kwargs["top_p"] = top_p
 
     if repetition_penalty is not None:
         gen_kwargs["repetition_penalty"] = repetition_penalty
@@ -308,6 +365,10 @@ def main(
             f"Output file: {output_path}\n"
             f"Source language: {source_lang}\n"
             f"Target language: {target_lang}\n"
+            f"LLM translation mode: {is_llm_translation}\n"
+            f"LLM target language: {llm_target_language}\n"
+            f"Context window: {context_window}\n"
+            f"Merge small blocks: {merge_small_blocks}\n"
             f"Force target lang as BOS token: {is_translation_model}\n"
             f"Prompt: {prompt}\n"
             f"Starting batch size: {starting_batch_size}\n"
@@ -411,6 +472,117 @@ def main(
 
         print(f"Translation done. Output written to {output_path}\n")
 
+    @find_executable_batch_size(starting_batch_size=starting_batch_size)
+    def llm_inference(batch_size, sentences_path, output_path):
+        nonlocal model, tokenizer, max_length, gen_kwargs
+
+        if not accelerator.is_main_process:
+            accelerator.wait_for_everyone()
+            return
+
+        print(f"Translating {sentences_path} with LLM batch size {batch_size}")
+        source_lines = read_text_lines(sentences_path)
+        groups = make_translation_groups(
+            source_lines,
+            merge_small_blocks=merge_small_blocks,
+            merge_max_chars=merge_max_chars,
+        )
+        translations = [None] * len(source_lines)
+        prepared_model = accelerator.prepare(model)
+
+        def generate_prompts(prompt_texts):
+            rendered_prompts = [
+                render_chat_prompt(tokenizer, prompt_text) for prompt_text in prompt_texts
+            ]
+            batch = tokenizer(
+                rendered_prompts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            batch = {key: value.to(accelerator.device) for key, value in batch.items()}
+            generated_tokens = accelerator.unwrap_model(prepared_model).generate(
+                **batch,
+                **gen_kwargs,
+            )
+            generated_tokens = generated_tokens[:, batch["input_ids"].shape[1] :]
+            return tokenizer.batch_decode(
+                generated_tokens,
+                skip_special_tokens=not keep_special_tokens,
+                clean_up_tokenization_spaces=not keep_tokenization_spaces,
+            )
+
+        def build_prompt_for_group(group):
+            context = build_context(
+                source_lines,
+                start_index=group[0],
+                end_index=group[-1],
+                window=context_window,
+            )
+            if len(group) == 1:
+                text = source_lines[group[0]]
+            else:
+                text = build_numbered_text(source_lines[index] for index in group)
+            return build_llm_prompt(
+                text=text,
+                target_language=llm_target_language,
+                context=context,
+                prompt_template=llm_prompt,
+            )
+
+        with tqdm(
+            total=len(source_lines),
+            desc="LLM translation",
+            leave=True,
+            ascii=True,
+        ) as pbar, open(output_path, "w", encoding="utf-8") as output_file:
+            with torch.no_grad():
+                for group_start in range(0, len(groups), batch_size):
+                    batch_groups = groups[group_start : group_start + batch_size]
+                    prompt_texts = [build_prompt_for_group(group) for group in batch_groups]
+                    decoded_outputs = generate_prompts(prompt_texts)
+
+                    for group, decoded_output in zip(batch_groups, decoded_outputs):
+                        if len(group) == 1:
+                            translations[group[0]] = decoded_output.strip()
+                            pbar.update(1)
+                            continue
+
+                        try:
+                            parsed_outputs = parse_numbered_translations(
+                                decoded_output,
+                                expected_count=len(group),
+                            )
+                        except ValueError:
+                            fallback_prompts = [
+                                build_llm_prompt(
+                                    text=source_lines[index],
+                                    target_language=llm_target_language,
+                                    context=build_context(
+                                        source_lines,
+                                        start_index=index,
+                                        end_index=index,
+                                        window=context_window,
+                                    ),
+                                    prompt_template=llm_prompt,
+                                )
+                                for index in group
+                            ]
+                            parsed_outputs = [
+                                output.strip() for output in generate_prompts(fallback_prompts)
+                            ]
+
+                        for index, translated_text in zip(group, parsed_outputs):
+                            translations[index] = translated_text.strip()
+                        pbar.update(len(group))
+
+            for translated_text in translations:
+                print(encode_string(translated_text or ""), file=output_file)
+
+        accelerator.wait_for_everyone()
+        print(f"Translation done. Output written to {output_path}\n")
+
     def translate_file(input_path, final_output_path):
         epub_work_paths = None
         translation_input_path = input_path
@@ -435,10 +607,16 @@ def main(
             accelerator.wait_for_everyone()
 
         os.makedirs(os.path.abspath(os.path.dirname(final_output_path)), exist_ok=True)
-        inference(
-            sentences_path=translation_input_path,
-            output_path=translation_output_path,
-        )
+        if is_llm_translation:
+            llm_inference(
+                sentences_path=translation_input_path,
+                output_path=translation_output_path,
+            )
+        else:
+            inference(
+                sentences_path=translation_input_path,
+                output_path=translation_output_path,
+            )
         accelerator.wait_for_everyone()
 
         if epub_work_paths is not None and is_epub_path(final_output_path):
@@ -528,9 +706,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--starting_batch_size",
         type=int,
-        default=128,
+        default=None,
         help="Starting batch size, we will automatically reduce it if we find an OOM error."
-        "If you use multiple devices, we will divide this number by the number of devices.",
+        "If you use multiple devices, we will divide this number by the number of devices. "
+        "Defaults to 128 for traditional MT models and 1 for LLM translation mode.",
     )
 
     parser.add_argument(
@@ -558,16 +737,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_length",
         type=int,
-        default=256,
+        default=None,
         help="Maximum number of tokens in the source sentence and generated sentence. "
-        "Increase this value to translate longer sentences, at the cost of increasing memory usage.",
+        "Increase this value to translate longer sentences, at the cost of increasing memory usage. "
+        "Defaults to 256 for traditional MT models and 2048 for LLM translation mode.",
     )
 
     parser.add_argument(
         "--num_beams",
         type=int,
-        default=5,
-        help="Number of beams for beam search, m2m10 author recommends 5, but it might use too much memory",
+        default=None,
+        help="Number of beams for beam search. Defaults to 5 for traditional MT models and 1 for LLM translation mode.",
     )
 
     parser.add_argument(
@@ -596,22 +776,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.8,
-        help="Temperature for sampling, value used only if do_sample is True.",
+        default=None,
+        help="Temperature for sampling, value used only if do_sample is True. Defaults to 0.8 for traditional MT models.",
     )
 
     parser.add_argument(
         "--top_k",
         type=int,
-        default=100,
-        help="If do_sample is True, will sample from the top k most likely tokens.",
+        default=None,
+        help="If do_sample is True, will sample from the top k most likely tokens. Defaults to 100 for traditional MT models.",
     )
 
     parser.add_argument(
         "--top_p",
         type=float,
-        default=0.75,
-        help="If do_sample is True, will sample from the top k most likely tokens.",
+        default=None,
+        help="If do_sample is True, will sample from nucleus probability mass top_p. Defaults to 0.75 for traditional MT models.",
     )
 
     parser.add_argument(
@@ -647,6 +827,41 @@ if __name__ == "__main__":
         help="If set we will trust remote code in HuggingFace models. This is required for some models.",
     )
 
+    parser.add_argument(
+        "--llm_target_language",
+        type=str,
+        default="Simplified Chinese",
+        help="Human-readable target language for LLM translation mode.",
+    )
+
+    parser.add_argument(
+        "--llm_prompt",
+        type=str,
+        default=None,
+        help="Prompt template for LLM translation mode. Must include {TEXT}. "
+        "May also include {CONTEXT}, {CONTEXT_SECTION}, and {TARGET_LANGUAGE}.",
+    )
+
+    parser.add_argument(
+        "--context_window",
+        type=int,
+        default=0,
+        help="Number of neighboring text blocks to provide as context in LLM translation mode.",
+    )
+
+    parser.add_argument(
+        "--merge_small_blocks",
+        action="store_true",
+        help="Merge neighboring short blocks into numbered LLM translation batches while preserving output line count.",
+    )
+
+    parser.add_argument(
+        "--merge_max_chars",
+        type=int,
+        default=1200,
+        help="Maximum total characters per merged short-block group in LLM translation mode.",
+    )
+
     args = parser.parse_args()
 
     main(
@@ -671,4 +886,9 @@ if __name__ == "__main__":
         repetition_penalty=args.repetition_penalty,
         prompt=args.prompt,
         trust_remote_code=args.trust_remote_code,
+        llm_target_language=args.llm_target_language,
+        llm_prompt=args.llm_prompt,
+        context_window=args.context_window,
+        merge_small_blocks=args.merge_small_blocks,
+        merge_max_chars=args.merge_max_chars,
     )

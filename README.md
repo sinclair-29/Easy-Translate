@@ -232,6 +232,50 @@ python3 translate.py \
 --prompt "Translate English to Spanish: %%SENTENCE%%" 
 ``` 
 
+### High-quality LLM translation
+
+Instruction-tuned chat models such as Qwen3/Qwen2.5 Instruct are handled with a
+dedicated LLM translation path instead of the traditional seq2seq translation
+path. Easy-Translate detects chat/instruction causal language models, applies
+the tokenizer chat template when available, and decodes only newly generated
+tokens. Existing NLLB, M2M100, SeamlessM4T, MBART, MarianMT, and other seq2seq
+translation models keep the original translation logic.
+
+The LLM translation path defaults to deterministic generation, a larger
+`--max_length` of 2048, `--num_beams 1`, and `--starting_batch_size 1` unless you
+override them. It also defaults to Simplified Chinese as the target language.
+
+```bash
+python3 translate.py \
+--sentences_path book.epub \
+--output_path book_zh.txt \
+--model_name /path/to/Qwen3-14B-Instruct \
+--precision fp16 \
+--context_window 1 \
+--merge_small_blocks \
+--max_length 2048
+```
+
+Use `--llm_target_language` to translate into another human-readable target
+language, and `--llm_prompt` to provide a full custom prompt template. Custom
+LLM prompts must include `{TEXT}` and may also include `{CONTEXT}`,
+`{CONTEXT_SECTION}`, and `{TARGET_LANGUAGE}`.
+
+```bash
+python3 translate.py \
+--sentences_path book.epub \
+--output_path book_ja.txt \
+--model_name /path/to/Qwen3-14B-Instruct \
+--precision fp16 \
+--llm_target_language "Japanese" \
+--context_window 2
+```
+
+`--context_window N` gives the model neighboring blocks as context while asking
+it to return only the current block's translation. `--merge_small_blocks` groups
+neighboring short blocks as numbered items, then maps the numbered translations
+back to the original line/block count so EPUB reconstruction remains compatible.
+
 
 ### Decoding/Sampling strategies
 
