@@ -517,10 +517,15 @@ def main(
                 for prompt_text in prompt_texts
             ]
             if all(prompt is not None for prompt in tokenized_prompts):
-                encoded_prompts = [
-                    prompt.squeeze(0).tolist() if hasattr(prompt, "squeeze") else prompt
-                    for prompt in tokenized_prompts
-                ]
+                encoded_prompts = []
+                for prompt in tokenized_prompts:
+                    if isinstance(prompt, dict):
+                        prompt = prompt["input_ids"]
+                    if hasattr(prompt, "squeeze"):
+                        prompt = prompt.squeeze(0)
+                    if hasattr(prompt, "tolist"):
+                        prompt = prompt.tolist()
+                    encoded_prompts.append(prompt)
                 return tokenizer.pad(
                     {"input_ids": encoded_prompts},
                     padding=True,
