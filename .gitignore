@@ -130,3 +130,9 @@ debug/
 
 .DS_Store
 toy_zh.epub
+
+# Local full-size source books
+shutdown.epub
+
+# Keep the lightweight validation fixture
+!shutdown_minimal.epub

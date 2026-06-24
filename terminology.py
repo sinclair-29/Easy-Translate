@@ -16,6 +16,19 @@ CAPITALIZED_PHRASE_RE = re.compile(
 )
 HYPHENATED_TERM_RE = re.compile(r"\b[A-Za-z][A-Za-z]+(?:-[A-Za-z][A-Za-z]+)+\b")
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]{2,}")
+URL_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
+URL_IN_TEXT_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+PUNCTUATION_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+DASH_TRANSLATION = str.maketrans(
+    {
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+    }
+)
 
 STOPWORDS = {
     "about",
@@ -54,18 +67,57 @@ PRIORITY_KINDS = {"heading", "toc", "metadata", "caption"}
 
 
 def _clean_candidate(text: str) -> str:
+    text = text.translate(DASH_TRANSLATION)
     return re.sub(r"\s+", " ", text.strip(" \t\r\n.,;:!?()[]{}<>\"'“”‘’")).strip()
+
+
+def _normalize_key(text: str) -> str:
+    text = _clean_candidate(text).casefold()
+    text = re.sub(r"[._/]+", " ", text)
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = re.sub(r"[^\w\s'’-]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    words = [_singularize_word(word) for word in text.split()]
+    return " ".join(words)
+
+
+def _singularize_word(word: str) -> str:
+    if len(word) <= 4:
+        return word
+    if word.endswith("ies"):
+        return word[:-3] + "y"
+    if word.endswith("es") and not word.endswith(("ses", "xes")):
+        return word[:-2]
+    if word.endswith("s") and not word.endswith(("ss", "us")):
+        return word[:-1]
+    return word
+
+
+def _variant_keys(text: str):
+    key = _normalize_key(text)
+    if not key:
+        return set()
+    variants = {key, key.replace("-", " "), key.replace(" ", "-")}
+    return {variant for variant in variants if variant}
 
 
 def _is_candidate_allowed(candidate: str) -> bool:
     if not candidate or len(candidate) < 2 or len(candidate) > 90:
         return False
+    if URL_RE.match(candidate):
+        return False
+    if PUNCTUATION_ONLY_RE.match(candidate):
+        return False
     if candidate.lower() in STOPWORDS:
         return False
     if candidate.isdigit():
         return False
+    if not any(character.isalpha() for character in candidate):
+        return False
     words = candidate.split()
     if len(words) == 1 and words[0].lower() in STOPWORDS:
+        return False
+    if len(words) == 1 and len(words[0]) <= 2 and not words[0].isupper():
         return False
     return True
 
@@ -89,7 +141,9 @@ def _add_candidate(
     if not _is_candidate_allowed(candidate):
         return
 
-    key = candidate.lower()
+    key = _normalize_key(candidate)
+    if not key:
+        return
     counts[key] += 1
     line_hits[key].add(line_index)
     if kind in PRIORITY_KINDS:
@@ -129,12 +183,14 @@ def collect_term_candidates(
     phrase_line_hits = defaultdict(set)
 
     for index, line in enumerate(source_lines):
+        line = URL_IN_TEXT_RE.sub(" ", line)
         kind = _metadata_kind(unit_metadata, index)
         for pattern in (ACRONYM_RE, CAPITALIZED_PHRASE_RE, HYPHENATED_TERM_RE):
             for match in pattern.finditer(line):
                 candidate = _clean_candidate(match.group(0))
-                key = candidate.lower()
-                display.setdefault(key, candidate)
+                key = _normalize_key(candidate)
+                if key:
+                    display.setdefault(key, candidate)
                 _add_candidate(
                     candidate,
                     line_index=index,
@@ -145,17 +201,21 @@ def collect_term_candidates(
                 )
 
         for phrase in _iter_repeated_phrase_candidates(line):
-            display.setdefault(phrase, phrase)
-            phrase_counts[phrase] += 1
-            phrase_line_hits[phrase].add(index)
+            key = _normalize_key(phrase)
+            if not key:
+                continue
+            display.setdefault(key, phrase)
+            phrase_counts[key] += 1
+            phrase_line_hits[key].add(index)
 
-    for phrase, count in phrase_counts.items():
-        if count < 2 or len(phrase_line_hits[phrase]) < 2:
+    for key, count in phrase_counts.items():
+        if count < 2 or len(phrase_line_hits[key]) < 2:
             continue
+        phrase = display.get(key, key)
         if not _is_candidate_allowed(phrase):
             continue
-        counts[phrase] += count
-        line_hits[phrase].update(phrase_line_hits[phrase])
+        counts[key] += count
+        line_hits[key].update(phrase_line_hits[key])
 
     candidates = []
     for key, count in counts.items():
@@ -299,7 +359,7 @@ def select_relevant_terms(
     text: str,
     limit: int = DEFAULT_RELEVANT_LIMIT,
 ) -> List[dict]:
-    haystack = (text or "").lower()
+    haystack = _normalize_key(text or "")
     if not haystack:
         return []
 
@@ -307,10 +367,10 @@ def select_relevant_terms(
     seen = set()
     for entry in _all_entries(memory):
         source = entry["source"]
-        key = source.lower()
-        if key in seen:
+        key = _normalize_key(source)
+        if not key or key in seen:
             continue
-        if key and key in haystack:
+        if any(variant in haystack for variant in _variant_keys(source)):
             seen.add(key)
             relevant.append(entry)
 

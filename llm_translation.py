@@ -17,7 +17,7 @@ Requirements:
 - Produce natural and readable {TARGET_LANGUAGE}.
 - If the text contains numbered items, return exactly the same item numbers in the same order.
 
-{CONTEXT_SECTION}{TERMINOLOGY_SECTION}Text:
+{DOCUMENT_CONTEXT_SECTION}{CONTEXT_SECTION}{TERMINOLOGY_SECTION}Text:
 
 {TEXT}"""
 
@@ -204,6 +204,7 @@ def build_llm_prompt(
     context: str = "",
     prompt_template: Optional[str] = None,
     terminology_section: str = "",
+    document_context_section: str = "",
 ) -> str:
     template = prompt_template or DEFAULT_LLM_PROMPT_TEMPLATE
     if "{TEXT}" not in template:
@@ -222,6 +223,8 @@ def build_llm_prompt(
         CONTEXT=context,
         CONTEXT_SECTION=context_section,
         TERMINOLOGY_SECTION=terminology_section,
+        DOCUMENT_CONTEXT=document_context_section.strip(),
+        DOCUMENT_CONTEXT_SECTION=document_context_section,
         TARGET_LANGUAGE=target_language,
     )
 

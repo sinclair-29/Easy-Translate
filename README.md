@@ -114,7 +114,7 @@ python3 translate.py \
 
 Use `--llm_prompt` to provide a custom prompt template. It must include `{TEXT}`;
 it may also include `{CONTEXT}`, `{CONTEXT_SECTION}`, `{TERMINOLOGY_SECTION}`,
-and `{TARGET_LANGUAGE}`.
+`{DOCUMENT_CONTEXT_SECTION}`, and `{TARGET_LANGUAGE}`.
 
 ```bash
 python3 translate.py \

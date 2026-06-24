@@ -86,6 +86,8 @@ def _fill_unit_metadata(
     file_name: Optional[str],
     item_id: Optional[str],
     section_group: int,
+    book_title: Optional[str] = None,
+    chapter_heading: Optional[str] = None,
 ) -> None:
     line_start = unit.get("line")
     if line_start is None:
@@ -98,6 +100,10 @@ def _fill_unit_metadata(
             "file_name": file_name,
             "item_id": item_id,
             "section_group": section_group,
+            "original_text": unit.get("original_text"),
+            "tag": unit.get("tag"),
+            "book_title": book_title,
+            "chapter_heading": chapter_heading,
         }
 
 
@@ -110,6 +116,11 @@ def load_epub_unit_metadata(manifest_path: Optional[str], total_lines: int):
 
     unit_metadata = [{} for _ in range(total_lines)]
     section_group = 0
+    book_title = None
+    for unit in manifest.get("metadata", []):
+        if unit.get("kind") == "opf_title" and unit.get("original_text"):
+            book_title = unit.get("original_text")
+            break
 
     for unit in manifest.get("metadata", []):
         _fill_unit_metadata(
@@ -119,14 +130,18 @@ def load_epub_unit_metadata(manifest_path: Optional[str], total_lines: int):
             file_name=unit.get("zip_name"),
             item_id=None,
             section_group=section_group,
+            book_title=book_title,
         )
 
     for manifest_item in manifest.get("items", []):
         section_group += 1
         file_name = manifest_item.get("file_name")
         item_id = manifest_item.get("item_id")
+        current_heading = None
         for block in manifest_item.get("blocks", []):
             kind = block.get("kind", "body")
+            if kind == "heading" and block.get("original_text"):
+                current_heading = block.get("original_text")
             _fill_unit_metadata(
                 unit_metadata,
                 block,
@@ -134,6 +149,8 @@ def load_epub_unit_metadata(manifest_path: Optional[str], total_lines: int):
                 file_name=file_name,
                 item_id=item_id,
                 section_group=section_group,
+                book_title=book_title,
+                chapter_heading=current_heading,
             )
             if kind == "heading":
                 section_group += 1
@@ -487,6 +504,34 @@ def main(
             )
             return format_terminology_section(relevant_entries)
 
+        def _compact_context_value(value, limit=120):
+            value = " ".join(str(value or "").split())
+            if len(value) <= limit:
+                return value
+            return value[: limit - 1].rstrip() + "..."
+
+        def document_context_section_for(index):
+            if unit_metadata is None or index >= len(unit_metadata):
+                return ""
+            metadata = unit_metadata[index] or {}
+            lines = []
+            book_title = _compact_context_value(metadata.get("book_title"))
+            chapter_heading = _compact_context_value(metadata.get("chapter_heading"))
+            kind = metadata.get("kind")
+            file_name = _compact_context_value(metadata.get("file_name"), limit=80)
+
+            if book_title:
+                lines.append(f"Book: {book_title}")
+            if chapter_heading and chapter_heading != book_title:
+                lines.append(f"Chapter: {chapter_heading}")
+            elif file_name:
+                lines.append(f"EPUB item: {file_name}")
+            if kind:
+                lines.append(f"Block kind: {kind}")
+            if not lines:
+                return ""
+            return "Document context for consistency only:\n" + "\n".join(lines) + "\n\n"
+
         def build_group_text(group):
             return build_numbered_text(source_lines[index] for index in group)
 
@@ -506,6 +551,7 @@ def main(
                 context=context,
                 prompt_template=llm_prompt,
                 terminology_section=terminology_section,
+                document_context_section=document_context_section_for(group[0]),
             )
 
         def prompt_token_count(prompt_text):
@@ -567,6 +613,7 @@ def main(
                 context=context,
                 prompt_template=llm_prompt,
                 terminology_section=terminology_section_for(full_text, context),
+                document_context_section=document_context_section_for(index),
             )
             if prompt_fits_budget(full_prompt):
                 decoded_output = generate_prompts(
@@ -589,6 +636,7 @@ def main(
                     context=context,
                     prompt_template=llm_prompt,
                     terminology_section=terminology_section_for(chunk_text, context),
+                    document_context_section=document_context_section_for(index),
                 )
                 return prompt_fits_budget(chunk_prompt)
 
@@ -615,6 +663,7 @@ def main(
                     context=context,
                     prompt_template=llm_prompt,
                     terminology_section=terminology_section_for(text, context),
+                    document_context_section=document_context_section_for(index),
                 )
 
             chunk_groups = make_translation_groups(
@@ -654,6 +703,7 @@ def main(
                             context="",
                             prompt_template=llm_prompt,
                             terminology_section=terminology_section_for(chunk_text, ""),
+                            document_context_section=document_context_section_for(index),
                         )
                         parsed_chunks.append(
                             generate_prompts(
@@ -985,7 +1035,7 @@ if __name__ == "__main__":
         default=None,
         help="Prompt template for LLM translation mode. Must include {TEXT}. "
         "May also include {CONTEXT}, {CONTEXT_SECTION}, {TERMINOLOGY_SECTION}, "
-        "and {TARGET_LANGUAGE}.",
+        "{DOCUMENT_CONTEXT_SECTION}, and {TARGET_LANGUAGE}.",
     )
 
     parser.add_argument(
