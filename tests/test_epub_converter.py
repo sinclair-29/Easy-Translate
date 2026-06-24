@@ -186,9 +186,9 @@ class EpubConverter(unittest.TestCase):
 
             self.assertIn("Tiny Book", lines)
             self.assertIn("Chapter One", lines)
-            self.assertIn("First paragraph.", lines)
+            self.assertIn("First paragraph. Second sentence.", lines)
             self.assertIn("Footnote sentence.", lines)
-            self.assertIn("chapter text", lines)
+            self.assertIn("Linked chapter text.", lines)
             self.assertIn("Caption text.", lines)
             self.assertNotIn("1", lines)
             self.assertTrue(os.path.exists(manifest_path))
@@ -213,14 +213,10 @@ class EpubConverter(unittest.TestCase):
                 "Tiny Book": "Libro Diminuto",
                 "Chapter One": "Capitulo Uno",
                 "Chapter Two": "Capitulo Dos",
-                "First paragraph.": "Primer parrafo.",
-                "Second sentence.": "Segunda frase.",
-                "Footnote sentence.": "Frase con nota 1",
-                "Linked": "Enlace",
-                "chapter text": "texto del capitulo",
-                ".": ".",
-                "Div-only text.": "Texto de div.",
-                "More div text.": "Mas texto de div.",
+                "First paragraph. Second sentence.": "Primer parrafo. Segunda frase.",
+                "Footnote sentence.": "Frase con nota",
+                "Linked chapter text.": "Enlace al texto del capitulo.",
+                "Div-only text. More div text.": "Texto de div. Mas texto de div.",
                 "Second item.": "Segundo elemento.",
                 "Quoted line.": "Linea citada.",
                 "Caption text.": "Texto de pie.",
@@ -247,7 +243,7 @@ class EpubConverter(unittest.TestCase):
             self.assertIn("Capitulo Uno", chapter)
             self.assertIn("Primer parrafo. Segunda frase.", chapter)
             self.assertIn('href="chapter2.xhtml"', chapter)
-            self.assertIn(">texto del capitulo<", chapter)
+            self.assertIn("Enlace al texto del capitulo.", chapter)
             self.assertNotIn("Frase con nota 1", chapter)
             self.assertIn("Frase con nota", chapter)
             self.assertIn('class="class_16563"', chapter)

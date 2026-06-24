@@ -1,8 +1,9 @@
 import argparse
 import glob
+import json
 import os
 import shutil
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from accelerate import Accelerator, find_executable_batch_size
@@ -61,6 +62,69 @@ def get_epub_language_code(llm_target_language: str) -> str:
             return "zh-Hant"
         return "zh-Hans"
     return "zh-Hans"
+
+
+def _fill_unit_metadata(
+    unit_metadata: List[dict],
+    unit: dict,
+    *,
+    kind: str,
+    file_name: Optional[str],
+    item_id: Optional[str],
+    section_group: int,
+) -> None:
+    line_start = unit.get("line")
+    if line_start is None:
+        return
+    line_count = unit.get("lines", 1)
+    for line in range(line_start, min(line_start + line_count, len(unit_metadata))):
+        unit_metadata[line] = {
+            "line": line,
+            "kind": kind,
+            "file_name": file_name,
+            "item_id": item_id,
+            "section_group": section_group,
+        }
+
+
+def load_epub_unit_metadata(manifest_path: Optional[str], total_lines: int):
+    if manifest_path is None or not os.path.exists(manifest_path):
+        return None
+
+    with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+        manifest = json.load(manifest_file)
+
+    unit_metadata = [{} for _ in range(total_lines)]
+    section_group = 0
+
+    for unit in manifest.get("metadata", []):
+        _fill_unit_metadata(
+            unit_metadata,
+            unit,
+            kind=unit.get("unit_kind", "metadata"),
+            file_name=unit.get("zip_name"),
+            item_id=None,
+            section_group=section_group,
+        )
+
+    for manifest_item in manifest.get("items", []):
+        section_group += 1
+        file_name = manifest_item.get("file_name")
+        item_id = manifest_item.get("item_id")
+        for block in manifest_item.get("blocks", []):
+            kind = block.get("kind", "body")
+            _fill_unit_metadata(
+                unit_metadata,
+                block,
+                kind=kind,
+                file_name=file_name,
+                item_id=item_id,
+                section_group=section_group,
+            )
+            if kind == "heading":
+                section_group += 1
+
+    return unit_metadata
 
 
 def main(
@@ -263,7 +327,7 @@ def main(
         print("\n")
 
     @find_executable_batch_size(starting_batch_size=starting_batch_size)
-    def llm_inference(batch_size, sentences_path, output_path):
+    def llm_inference(batch_size, sentences_path, output_path, manifest_path=None):
         nonlocal model, tokenizer, max_length, gen_kwargs
 
         if not accelerator.is_main_process:
@@ -272,10 +336,12 @@ def main(
 
         print(f"Translating {sentences_path} with LLM batch size {batch_size}")
         source_lines = read_text_lines(sentences_path)
+        unit_metadata = load_epub_unit_metadata(manifest_path, len(source_lines))
         groups = make_translation_groups(
             source_lines,
             merge_small_blocks=merge_small_blocks,
             merge_max_chars=merge_max_chars,
+            unit_metadata=unit_metadata,
         )
         translations = [None] * len(source_lines)
         prepared_model = accelerator.prepare(model)
@@ -425,12 +491,14 @@ def main(
 
     def translate_file(input_path, final_output_path):
         epub_work_paths = None
+        translation_manifest_path = None
         translation_input_path = input_path
         translation_output_path = final_output_path
 
         if is_epub_path(input_path):
             epub_work_paths = get_epub_work_paths(input_path, final_output_path)
             translation_input_path = epub_work_paths["source_text"]
+            translation_manifest_path = epub_work_paths["manifest"]
             if is_epub_path(final_output_path):
                 translation_output_path = epub_work_paths["translated_text"]
 
@@ -450,6 +518,7 @@ def main(
         llm_inference(
             sentences_path=translation_input_path,
             output_path=translation_output_path,
+            manifest_path=translation_manifest_path,
         )
         accelerator.wait_for_everyone()
 

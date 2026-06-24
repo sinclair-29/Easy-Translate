@@ -52,8 +52,6 @@ BLOCK_TAGS = (
     "dd",
 )
 
-SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？])\s+")
-MAX_TRANSLATION_UNIT_CHARS = 600
 DEFAULT_TRANSLATED_EPUB_LANGUAGE = "zh-Hans"
 CHINESE_STYLE_ID = "easytranslate-chinese-style"
 CHINESE_STYLE = """
@@ -98,6 +96,50 @@ LINK_PRESERVING_TAGS = {
     "track",
     "video",
 }
+HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+TABLE_CELL_TAGS = {"td", "th"}
+CAPTION_TAGS = {"caption", "figcaption"}
+TOC_HINTS = {"nav", "toc", "contents", "table-of-contents"}
+NOTE_HINTS = {"note", "notes", "footnote", "footnotes", "endnote", "endnotes"}
+BIBLIOGRAPHY_HINTS = {
+    "bibliography",
+    "biblio",
+    "references",
+    "reference",
+    "works-cited",
+    "workscited",
+}
+INDEX_HINTS = {"index", "indices"}
+STRUCTURAL_TEXT_RESIDUES = {
+    "body",
+    "head",
+    "html",
+    "xhtml",
+}
+ROMAN_PAGE_MARKERS = {
+    "i",
+    "ii",
+    "iii",
+    "iv",
+    "v",
+    "vi",
+    "vii",
+    "viii",
+    "ix",
+    "x",
+    "xi",
+    "xii",
+    "xiii",
+    "xiv",
+    "xv",
+    "xvi",
+    "xvii",
+    "xviii",
+    "xix",
+    "xx",
+}
+URL_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
+XML_DECLARATION_RE = re.compile(r"^\??xml\b|^<\?xml\b", re.IGNORECASE)
 
 
 def require_epub_dependencies() -> None:
@@ -159,12 +201,49 @@ def _normalize_text(text: str) -> str:
     return " ".join(text.split())
 
 
+def _normalize_source_text(text: str) -> str:
+    text = _normalize_text(text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"([(\[{])\s+", r"\1", text)
+    text = re.sub(r"\s+([)\]}])", r"\1", text)
+    return text
+
+
 def _normalize_output_text(text: str) -> str:
     text = _normalize_text(text)
     text = re.sub(r"\s+([，。！？；：、）】》」』])", r"\1", text)
     text = re.sub(r"([（【《「『])\s+", r"\1", text)
     text = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", text)
     return text
+
+
+def _is_punctuation_only(text: str) -> bool:
+    return bool(re.fullmatch(r"[\W_]+", text, flags=re.UNICODE))
+
+
+def _is_short_roman_page_marker(text: str) -> bool:
+    marker = text.strip().strip("[](){}.,;:").lower()
+    return marker in ROMAN_PAGE_MARKERS
+
+
+def _is_translatable_text(text: str) -> bool:
+    text = _normalize_text(text)
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered in STRUCTURAL_TEXT_RESIDUES:
+        return False
+    if XML_DECLARATION_RE.search(text):
+        return False
+    if URL_RE.fullmatch(text):
+        return False
+    if _is_numeric_text(text):
+        return False
+    if _is_short_roman_page_marker(text):
+        return False
+    if _is_punctuation_only(text):
+        return False
+    return True
 
 
 def _tag_name_matches(tag, name: str) -> bool:
@@ -181,43 +260,83 @@ def _find_all_tags(soup: BeautifulSoup, name: str):
     return soup.find_all(lambda tag: _tag_name_matches(tag, name))
 
 
-def _split_long_text(text: str, max_chars: int) -> List[str]:
-    if len(text) <= max_chars:
-        return [text]
+def _local_tag_name(tag) -> str:
+    tag_name = (getattr(tag, "name", "") or "").lower()
+    return tag_name.rsplit(":", 1)[-1]
 
-    chunks = []
-    remaining = text
-    while len(remaining) > max_chars:
-        split_at = max(
-            remaining.rfind("; ", 0, max_chars),
-            remaining.rfind(", ", 0, max_chars),
-            remaining.rfind(" ", 0, max_chars),
+
+def _contains_hint(text: str, hints: set) -> bool:
+    normalized = (text or "").lower().replace("_", "-")
+    tokens = set(re.split(r"[^a-z0-9]+", normalized))
+    return any(
+        hint in tokens or ("-" in hint and hint in normalized)
+        for hint in hints
+    )
+
+
+def _item_hint_text(item) -> str:
+    return " ".join(
+        str(value)
+        for value in (
+            getattr(item, "id", ""),
+            item.get_id() if hasattr(item, "get_id") else "",
+            item.get_name() if hasattr(item, "get_name") else "",
         )
-        if split_at < max_chars // 2:
-            split_at = max_chars
-        chunk = remaining[:split_at].strip()
-        if chunk:
-            chunks.append(chunk)
-        remaining = remaining[split_at:].strip()
+        if value
+    )
 
-    if remaining:
-        chunks.append(remaining)
-    return chunks
+
+def _block_hint_text(block) -> str:
+    values = []
+    current = block
+    while current is not None and getattr(current, "name", None):
+        for attr in ("id", "role", "epub:type", "type"):
+            value = current.get(attr)
+            if value:
+                values.append(" ".join(value) if isinstance(value, list) else str(value))
+        classes = current.get("class") or []
+        if classes:
+            values.append(" ".join(str(value) for value in classes))
+        current = current.parent
+    return " ".join(values)
+
+
+def _kind_from_hints(hint_text: str):
+    if _contains_hint(hint_text, TOC_HINTS):
+        return "toc"
+    if _contains_hint(hint_text, NOTE_HINTS):
+        return "note"
+    if _contains_hint(hint_text, BIBLIOGRAPHY_HINTS):
+        return "bibliography"
+    if _contains_hint(hint_text, INDEX_HINTS):
+        return "index"
+    return None
+
+
+def _infer_block_kind(block, item) -> str:
+    item_kind = _kind_from_hints(_item_hint_text(item))
+    if item_kind is not None:
+        return item_kind
+
+    tag_name = _local_tag_name(block)
+    if tag_name in HEADING_TAGS:
+        return "heading"
+    if tag_name in TABLE_CELL_TAGS:
+        return "table_cell"
+    if tag_name in CAPTION_TAGS:
+        return "caption"
+
+    block_kind = _kind_from_hints(_block_hint_text(block))
+    if block_kind is not None:
+        return block_kind
+    return "body"
 
 
 def split_translation_units(text: str) -> List[str]:
-    sentences = [
-        sentence.strip()
-        for sentence in SENTENCE_BOUNDARY.split(text)
-        if sentence.strip()
-    ]
-    if not sentences:
+    text = _normalize_source_text(text)
+    if not _is_translatable_text(text):
         return []
-
-    units = []
-    for sentence in sentences:
-        units.extend(_split_long_text(sentence, MAX_TRANSLATION_UNIT_CHARS))
-    return units
+    return [text]
 
 
 def _item_media_type(item) -> str:
@@ -252,12 +371,32 @@ def _document_items_in_reading_order(book) -> Iterable:
             yield item
 
 
+def _visible_text_for_block(block) -> str:
+    parts = []
+    for node in block.find_all(string=True):
+        if not isinstance(node, NavigableString):
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        if parent.name and parent.name.lower() in EXCLUDED_TEXT_PARENTS:
+            continue
+        if parent.find_parent(EXCLUDED_TEXT_PARENTS):
+            continue
+        if _is_structural_note_link(parent):
+            continue
+        text = _normalize_text(str(node))
+        if text:
+            parts.append(text)
+    return _normalize_source_text(" ".join(parts))
+
+
 def _iter_translatable_blocks(soup: BeautifulSoup) -> Iterable:
     for block in soup.find_all(BLOCK_TAGS):
         if block.find(BLOCK_TAGS):
             continue
-        text = _normalize_text(block.get_text(" ", strip=True))
-        if text:
+        text = _visible_text_for_block(block)
+        if _is_translatable_text(text):
             yield block
 
 
@@ -360,12 +499,13 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
         content = item.get_content()
         soup = _parse_html(content)
         blocks = []
-        candidates = list(_iter_translatable_text_nodes(soup))
-        extraction_mode = "text_nodes"
+        candidates = list(_iter_translatable_blocks(soup))
+        extraction_mode = "blocks"
 
         for block_index, block in enumerate(candidates):
-            text = _normalize_text(str(block))
-            tag = block.parent.name if block.parent is not None else None
+            text = _visible_text_for_block(block)
+            tag = block.name
+            kind = _infer_block_kind(block, item)
             text_lines = split_translation_units(text)
             if not text_lines:
                 continue
@@ -375,6 +515,7 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
                     "lines": len(text_lines),
                     "block_index": block_index,
                     "tag": tag,
+                    "kind": kind,
                     "original_text": text,
                 }
             )
@@ -468,14 +609,15 @@ def _append_translation_unit(
     text: str,
     **metadata,
 ) -> None:
-    text_lines = split_translation_units(_normalize_text(text))
+    text = _normalize_source_text(text)
+    text_lines = split_translation_units(text)
     if not text_lines:
         return
     manifest_units.append(
         {
             "line": len(lines),
             "lines": len(text_lines),
-            "original_text": _normalize_text(text),
+            "original_text": text,
             **metadata,
         }
     )
@@ -504,6 +646,7 @@ def _append_epub_metadata_units(
                 lines,
                 title.get_text(" ", strip=True),
                 kind="opf_title",
+                unit_kind="metadata",
                 zip_name=opf_path,
             )
 
@@ -522,6 +665,7 @@ def _append_epub_metadata_units(
                         lines,
                         text_tag.get_text(" ", strip=True),
                         kind="ncx_label",
+                        unit_kind="metadata",
                         zip_name=ncx_path,
                         index=index,
                     )
@@ -541,6 +685,7 @@ def _append_epub_metadata_units(
                         lines,
                         str(node),
                         kind="nav_text",
+                        unit_kind="metadata",
                         zip_name=nav_path,
                         index=index,
                     )

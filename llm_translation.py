@@ -224,6 +224,7 @@ def make_translation_groups(
     lines: List[str],
     merge_small_blocks: bool,
     merge_max_chars: int,
+    unit_metadata: Optional[List[dict]] = None,
 ):
     if not merge_small_blocks:
         return [[index] for index in range(len(lines))]
@@ -237,7 +238,12 @@ def make_translation_groups(
         can_merge = line_chars <= merge_max_chars
         would_fit = current_chars + line_chars <= merge_max_chars
 
-        if can_merge and current_group and would_fit:
+        if (
+            can_merge
+            and current_group
+            and would_fit
+            and _can_merge_units(current_group[-1], index, unit_metadata)
+        ):
             current_group.append(index)
             current_chars += line_chars
             continue
@@ -252,6 +258,39 @@ def make_translation_groups(
         groups.append(current_group)
 
     return groups
+
+
+def _metadata_for_index(unit_metadata: Optional[List[dict]], index: int) -> dict:
+    if unit_metadata is None or index >= len(unit_metadata):
+        return {}
+    return unit_metadata[index] or {}
+
+
+def _can_merge_units(
+    previous_index: int,
+    current_index: int,
+    unit_metadata: Optional[List[dict]],
+) -> bool:
+    if unit_metadata is None:
+        return True
+
+    previous = _metadata_for_index(unit_metadata, previous_index)
+    current = _metadata_for_index(unit_metadata, current_index)
+    previous_kind = previous.get("kind", "body")
+    current_kind = current.get("kind", "body")
+    if previous_kind != current_kind:
+        return False
+    if current_kind == "heading":
+        return False
+
+    for key in ("file_name", "item_id", "section_group"):
+        previous_value = previous.get(key)
+        current_value = current.get(key)
+        if previous_value is not None and current_value is not None:
+            if previous_value != current_value:
+                return False
+
+    return True
 
 
 NUMBERED_LINE_PATTERN = re.compile(
