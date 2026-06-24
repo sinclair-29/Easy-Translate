@@ -52,6 +52,22 @@ BLOCK_TAGS = (
 
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？])\s+")
 MAX_TRANSLATION_UNIT_CHARS = 600
+DEFAULT_TRANSLATED_EPUB_LANGUAGE = "zh-Hans"
+CHINESE_STYLE_ID = "easytranslate-chinese-style"
+CHINESE_STYLE = """
+html[lang|="zh"], body {
+  text-align: start;
+  line-height: 1.65;
+}
+p, div, li, blockquote, dd, dt, td, th {
+  text-align: start;
+  word-break: break-word;
+}
+a[style*="vertical-align: super"],
+a[class] {
+  text-decoration: none;
+}
+""".strip()
 EXCLUDED_TEXT_PARENTS = {
     "head",
     "link",
@@ -60,6 +76,14 @@ EXCLUDED_TEXT_PARENTS = {
     "style",
     "svg",
     "title",
+}
+NOTE_LINK_CLASSES = {
+    "class_16563",
+    "class_16588",
+    "class_16870",
+    "class_18946",
+    "class_19502",
+    "class_19515",
 }
 LINK_PRESERVING_TAGS = {
     "a",
@@ -81,6 +105,28 @@ def require_epub_dependencies() -> None:
 
 def _normalize_text(text: str) -> str:
     return " ".join(text.split())
+
+
+def _normalize_output_text(text: str) -> str:
+    text = _normalize_text(text)
+    text = re.sub(r"\s+([，。！？；：、）】》」』])", r"\1", text)
+    text = re.sub(r"([（【《「『])\s+", r"\1", text)
+    text = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", text)
+    return text
+
+
+def _tag_name_matches(tag, name: str) -> bool:
+    tag_name = (getattr(tag, "name", "") or "").lower()
+    name = name.lower()
+    return tag_name == name or tag_name.endswith(f":{name}")
+
+
+def _find_first_tag(soup: BeautifulSoup, name: str):
+    return soup.find(lambda tag: _tag_name_matches(tag, name))
+
+
+def _find_all_tags(soup: BeautifulSoup, name: str):
+    return soup.find_all(lambda tag: _tag_name_matches(tag, name))
 
 
 def _split_long_text(text: str, max_chars: int) -> List[str]:
@@ -174,9 +220,48 @@ def _iter_translatable_text_nodes(soup: BeautifulSoup) -> Iterable:
             continue
         if parent.find_parent(EXCLUDED_TEXT_PARENTS):
             continue
+        if _is_structural_note_link(parent):
+            continue
         text = _normalize_text(str(node))
         if text:
             yield node
+
+
+def _is_numeric_text(text: str) -> bool:
+    return bool(re.fullmatch(r"[\[\(]?\d{1,4}[\]\)]?", _normalize_text(text)))
+
+
+def _is_structural_note_link(tag) -> bool:
+    if tag is None or getattr(tag, "name", None) != "a":
+        return False
+    text = _normalize_text(tag.get_text("", strip=True))
+    if not _is_numeric_text(text):
+        return False
+    classes = set(tag.get("class") or [])
+    if classes & NOTE_LINK_CLASSES:
+        return True
+    href = tag.get("href", "")
+    return "#" in href and len(text) <= 4
+
+
+def _strip_duplicate_note_number(text: str, next_node) -> str:
+    sibling = next_node
+    while sibling is not None:
+        if isinstance(sibling, NavigableString):
+            if _normalize_text(str(sibling)):
+                return text
+            sibling = sibling.next_sibling
+            continue
+        if getattr(sibling, "name", None) == "span" and not _normalize_text(
+            sibling.get_text(" ", strip=True)
+        ):
+            sibling = sibling.next_sibling
+            continue
+        if _is_structural_note_link(sibling):
+            note_number = re.escape(_normalize_text(sibling.get_text("", strip=True)))
+            return re.sub(rf"\s*{note_number}\s*$", "", text).rstrip()
+        return text
+    return text
 
 
 def _has_linked_descendant(block) -> bool:
@@ -212,32 +297,26 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
     manifest = {
         "source_epub": os.path.abspath(epub_path),
         "items": [],
+        "metadata": [],
+        "target_language_code": DEFAULT_TRANSLATED_EPUB_LANGUAGE,
     }
     lines: List[str] = []
+
+    _append_epub_metadata_units(epub_path, manifest, lines)
 
     for item in _document_items_in_reading_order(book):
         content = item.get_content()
         soup = BeautifulSoup(content, "lxml")
         blocks = []
-        candidates = list(_iter_translatable_blocks(soup))
-        visible_text = _normalize_text(soup.get_text(" ", strip=True))
-        candidate_text_length = sum(
-            len(_normalize_text(block.get_text(" ", strip=True)))
-            for block in candidates
-        )
-        extraction_mode = "blocks"
-        if visible_text and candidate_text_length < len(visible_text) * 0.8:
-            candidates = list(_iter_translatable_text_nodes(soup))
-            extraction_mode = "text_nodes"
+        candidates = list(_iter_translatable_text_nodes(soup))
+        extraction_mode = "text_nodes"
 
         for block_index, block in enumerate(candidates):
-            if extraction_mode == "text_nodes":
-                text = _normalize_text(str(block))
-                tag = block.parent.name if block.parent is not None else None
-            else:
-                text = _normalize_text(block.get_text(" ", strip=True))
-                tag = block.name
+            text = _normalize_text(str(block))
+            tag = block.parent.name if block.parent is not None else None
             text_lines = split_translation_units(text)
+            if not text_lines:
+                continue
             blocks.append(
                 {
                     "line": len(lines),
@@ -307,6 +386,112 @@ def _epub_root_dir(epub_path: str) -> str:
             full_path = element.attrib.get("full-path", "")
             return posixpath.dirname(full_path)
     return ""
+
+
+def _epub_opf_path(epub_path: str) -> str:
+    with ZipFile(epub_path) as epub_zip:
+        container = epub_zip.read("META-INF/container.xml")
+    root = ET.fromstring(container)
+    for element in root.iter():
+        if element.tag.endswith("rootfile"):
+            return element.attrib.get("full-path", "")
+    return ""
+
+
+def _manifest_item_hrefs(opf_content: bytes) -> Dict[str, str]:
+    root = ET.fromstring(opf_content)
+    items = {}
+    for element in root.iter():
+        if element.tag.endswith("item"):
+            item_id = element.attrib.get("id")
+            href = element.attrib.get("href")
+            if item_id and href:
+                items[item_id] = href
+    return items
+
+
+def _append_translation_unit(
+    manifest_units: List[Dict],
+    lines: List[str],
+    text: str,
+    **metadata,
+) -> None:
+    text_lines = split_translation_units(_normalize_text(text))
+    if not text_lines:
+        return
+    manifest_units.append(
+        {
+            "line": len(lines),
+            "lines": len(text_lines),
+            "original_text": _normalize_text(text),
+            **metadata,
+        }
+    )
+    lines.extend(text_lines)
+
+
+def _append_epub_metadata_units(
+    epub_path: str,
+    manifest: Dict,
+    lines: List[str],
+) -> None:
+    root_dir = _epub_root_dir(epub_path)
+    opf_path = _epub_opf_path(epub_path)
+    if not opf_path:
+        return
+
+    with ZipFile(epub_path) as epub_zip:
+        if opf_path not in epub_zip.namelist():
+            return
+        opf_content = epub_zip.read(opf_path)
+        opf_soup = BeautifulSoup(opf_content, "xml")
+        title = _find_first_tag(opf_soup, "title")
+        if title is not None:
+            _append_translation_unit(
+                manifest["metadata"],
+                lines,
+                title.get_text(" ", strip=True),
+                kind="opf_title",
+                zip_name=opf_path,
+            )
+
+        item_hrefs = _manifest_item_hrefs(opf_content)
+        toc_href = item_hrefs.get("toc")
+        if toc_href:
+            ncx_path = posixpath.normpath(posixpath.join(root_dir, toc_href))
+            if ncx_path in epub_zip.namelist():
+                ncx_soup = BeautifulSoup(epub_zip.read(ncx_path), "xml")
+                for index, label in enumerate(_find_all_tags(ncx_soup, "navLabel")):
+                    text_tag = _find_first_tag(label, "text")
+                    if text_tag is None:
+                        continue
+                    _append_translation_unit(
+                        manifest["metadata"],
+                        lines,
+                        text_tag.get_text(" ", strip=True),
+                        kind="ncx_label",
+                        zip_name=ncx_path,
+                        index=index,
+                    )
+
+        nav_href = None
+        for item_id, href in item_hrefs.items():
+            if item_id.lower() == "nav":
+                nav_href = href
+                break
+        if nav_href:
+            nav_path = posixpath.normpath(posixpath.join(root_dir, nav_href))
+            if nav_path in epub_zip.namelist():
+                nav_soup = BeautifulSoup(epub_zip.read(nav_path), "lxml")
+                for index, node in enumerate(_iter_translatable_text_nodes(nav_soup)):
+                    _append_translation_unit(
+                        manifest["metadata"],
+                        lines,
+                        str(node),
+                        kind="nav_text",
+                        zip_name=nav_path,
+                        index=index,
+                    )
 
 
 def _zip_name_for_item(epub_zip: ZipFile, file_name: str, root_dir: str) -> str:
@@ -382,11 +567,100 @@ def _write_epub_preserving_package(
         raise
 
 
+def _translated_text_for_unit(unit: Dict, translated_lines: List[str]) -> str:
+    line_start = unit["line"]
+    line_count = unit.get("lines", 1)
+    return _normalize_output_text(
+        " ".join(translated_lines[line_start : line_start + line_count])
+    )
+
+
+def _set_xhtml_language(soup: BeautifulSoup, language_code: str) -> None:
+    html = soup.find("html")
+    if html is not None:
+        html["lang"] = language_code
+        html["xml:lang"] = language_code
+
+
+def _append_chinese_css_overrides(content: bytes) -> bytes:
+    text = content.decode("utf-8", errors="replace")
+    if CHINESE_STYLE_ID in text:
+        return content
+    text = f"{text.rstrip()}\n\n/* {CHINESE_STYLE_ID} */\n{CHINESE_STYLE}\n"
+    return text.encode("utf-8")
+
+
+def _apply_metadata_replacements(
+    replacements: Dict[str, bytes],
+    epub_zip: ZipFile,
+    metadata_units: List[Dict],
+    translated_lines: List[str],
+    language_code: str,
+) -> None:
+    units_by_zip: Dict[str, List[Dict]] = {}
+    for unit in metadata_units:
+        units_by_zip.setdefault(unit["zip_name"], []).append(unit)
+
+    for zip_name, units in units_by_zip.items():
+        if zip_name not in epub_zip.namelist():
+            continue
+        parser = "xml" if zip_name.endswith((".opf", ".ncx")) else "lxml"
+        soup = BeautifulSoup(
+            replacements.get(zip_name, epub_zip.read(zip_name)),
+            parser,
+        )
+        for unit in units:
+            translated_text = _translated_text_for_unit(unit, translated_lines)
+            if unit["kind"] == "opf_title":
+                title = _find_first_tag(soup, "title")
+                if title is not None:
+                    title.clear()
+                    title.append(translated_text)
+            elif unit["kind"] == "ncx_label":
+                labels = _find_all_tags(soup, "navLabel")
+                if unit["index"] < len(labels):
+                    text_tag = _find_first_tag(labels[unit["index"]], "text")
+                    if text_tag is not None:
+                        text_tag.clear()
+                        text_tag.append(translated_text)
+            elif unit["kind"] == "nav_text":
+                nodes = list(_iter_translatable_text_nodes(soup))
+                if unit["index"] < len(nodes):
+                    nodes[unit["index"]].replace_with(translated_text)
+
+        language_tag = _find_first_tag(soup, "language")
+        if language_tag is not None:
+            language_tag.clear()
+            language_tag.append(language_code)
+        _set_xhtml_language(soup, language_code)
+        replacements[zip_name] = str(soup).encode("utf-8")
+
+
+def _apply_language_and_css_replacements(
+    replacements: Dict[str, bytes],
+    epub_zip: ZipFile,
+    language_code: str,
+) -> None:
+    for zip_name in epub_zip.namelist():
+        if zip_name.endswith((".xhtml", ".html")):
+            soup = BeautifulSoup(
+                replacements.get(zip_name, epub_zip.read(zip_name)),
+                "lxml",
+            )
+            _set_xhtml_language(soup, language_code)
+            replacements[zip_name] = str(soup).encode("utf-8")
+        elif zip_name.endswith(".css"):
+            replacements[zip_name] = _append_chinese_css_overrides(
+                replacements.get(zip_name, epub_zip.read(zip_name))
+            )
+
+
 def text_to_epub(
     original_epub_path: str,
     translated_text_path: str,
     manifest_path: str,
     output_epub_path: str,
+    target_language_code: str = DEFAULT_TRANSLATED_EPUB_LANGUAGE,
 ) -> None:
     """Rebuild an EPUB by replacing extracted blocks with translated lines."""
     require_epub_dependencies()
@@ -398,6 +672,8 @@ def text_to_epub(
     expected_lines = sum(
         sum(block.get("lines", 1) for block in item["blocks"])
         for item in manifest["items"]
+    ) + sum(
+        unit.get("lines", 1) for unit in manifest.get("metadata", [])
     )
     if len(translated_lines) != expected_lines:
         raise ValueError(
@@ -428,12 +704,12 @@ def text_to_epub(
                 )
 
             for block, block_info in zip(blocks, manifest_item["blocks"]):
-                line_start = block_info["line"]
-                line_count = block_info.get("lines", 1)
-                translated_text = " ".join(
-                    translated_lines[line_start : line_start + line_count]
-                )
+                translated_text = _translated_text_for_unit(block_info, translated_lines)
                 if extraction_mode == "text_nodes":
+                    translated_text = _strip_duplicate_note_number(
+                        translated_text,
+                        block.next_sibling,
+                    )
                     block.replace_with(translated_text)
                 elif _has_linked_descendant(block):
                     _replace_block_text_preserving_links(block, translated_text)
@@ -442,6 +718,19 @@ def text_to_epub(
                     block.append(translated_text)
 
             replacements[zip_name] = str(soup).encode("utf-8")
+
+        _apply_metadata_replacements(
+            replacements,
+            epub_zip,
+            manifest.get("metadata", []),
+            translated_lines,
+            target_language_code,
+        )
+        _apply_language_and_css_replacements(
+            replacements,
+            epub_zip,
+            target_language_code,
+        )
 
     _write_epub_preserving_package(
         original_epub_path,

@@ -62,6 +62,18 @@ def get_epub_work_paths(input_path: str, output_path: str):
     }
 
 
+def get_epub_language_code(target_lang: Optional[str], llm_target_language: str) -> str:
+    if target_lang in {"zho_Hans", "zh", "zh_CN", "zh-Hans"}:
+        return "zh-Hans"
+    if target_lang in {"zho_Hant", "zh_TW", "zh-Hant"}:
+        return "zh-Hant"
+    if llm_target_language and "chinese" in llm_target_language.lower():
+        if "traditional" in llm_target_language.lower():
+            return "zh-Hant"
+        return "zh-Hans"
+    return target_lang or "zh-Hans"
+
+
 def model_supports_language_tokens(model, tokenizer) -> bool:
     return hasattr(tokenizer, "lang_code_to_id") or model.config.model_type in {
         "m2m_100",
@@ -697,6 +709,10 @@ def main(
                     translated_text_path=epub_work_paths["translated_text"],
                     manifest_path=epub_work_paths["manifest"],
                     output_epub_path=epub_work_paths["output_path"],
+                    target_language_code=get_epub_language_code(
+                        target_lang,
+                        llm_target_language,
+                    ),
                 )
                 shutil.rmtree(epub_work_paths["work_dir"], ignore_errors=True)
             accelerator.wait_for_everyone()

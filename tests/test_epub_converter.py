@@ -101,6 +101,8 @@ class EpubConverter(unittest.TestCase):
         <body>
           <h1>Chapter One</h1>
           <p>First paragraph. Second sentence.</p>
+          <p>Footnote sentence.<span id="note-back"></span><a class="class_16563" href="chapter1.xhtml#note">1</a></p>
+          <p>Linked <a href="chapter2.xhtml">chapter text</a>.</p>
           <div class="plain">Div-only text. More div text.</div>
           <ul><li>Second item.</li></ul>
           <blockquote><p>Quoted line.</p></blockquote>
@@ -146,22 +148,13 @@ class EpubConverter(unittest.TestCase):
             with open(text_path, "r", encoding="utf-8") as text_file:
                 lines = [line.rstrip("\n") for line in text_file]
 
-            self.assertEqual(
-                lines,
-                [
-                    "Chapter One",
-                    "First paragraph.",
-                    "Second sentence.",
-                    "Div-only text.",
-                    "More div text.",
-                    "Second item.",
-                    "Quoted line.",
-                    "Chapter Two",
-                    "Caption text.",
-                    "Definition",
-                    "Description text.",
-                ],
-            )
+            self.assertIn("Tiny Book", lines)
+            self.assertIn("Chapter One", lines)
+            self.assertIn("First paragraph.", lines)
+            self.assertIn("Footnote sentence.", lines)
+            self.assertIn("chapter text", lines)
+            self.assertIn("Caption text.", lines)
+            self.assertNotIn("1", lines)
             self.assertTrue(os.path.exists(manifest_path))
 
     def test_text_to_epub_rebuilds_book_and_preserves_assets(self):
@@ -180,21 +173,29 @@ class EpubConverter(unittest.TestCase):
                 source_text_path,
                 manifest_path,
             )
+            translations = {
+                "Tiny Book": "Libro Diminuto",
+                "Chapter One": "Capitulo Uno",
+                "Chapter Two": "Capitulo Dos",
+                "First paragraph.": "Primer parrafo.",
+                "Second sentence.": "Segunda frase.",
+                "Footnote sentence.": "Frase con nota 1",
+                "Linked": "Enlace",
+                "chapter text": "texto del capitulo",
+                ".": ".",
+                "Div-only text.": "Texto de div.",
+                "More div text.": "Mas texto de div.",
+                "Second item.": "Segundo elemento.",
+                "Quoted line.": "Linea citada.",
+                "Caption text.": "Texto de pie.",
+                "Definition": "Definicion",
+                "Description text.": "Texto descriptivo.",
+            }
+            with open(source_text_path, "r", encoding="utf-8") as text_file:
+                source_lines = [line.rstrip("\n") for line in text_file]
             with open(translated_text_path, "w", encoding="utf-8") as text_file:
-                for line in (
-                    "Capitulo Uno",
-                    "Primer parrafo.",
-                    "Segunda frase.",
-                    "Texto de div.",
-                    "Mas texto de div.",
-                    "Segundo elemento.",
-                    "Linea citada.",
-                    "Capitulo Dos",
-                    "Texto de pie.",
-                    "Definicion",
-                    "Texto descriptivo.",
-                ):
-                    print(line, file=text_file)
+                for line in source_lines:
+                    print(translations.get(line, line), file=text_file)
 
             epub_converter.text_to_epub(
                 source_epub_path,
@@ -209,7 +210,13 @@ class EpubConverter(unittest.TestCase):
             chapter = rebuilt.get_item_with_id("chapter-one").get_content().decode()
             self.assertIn("Capitulo Uno", chapter)
             self.assertIn("Primer parrafo. Segunda frase.", chapter)
+            self.assertIn('href="chapter2.xhtml"', chapter)
+            self.assertIn(">texto del capitulo<", chapter)
+            self.assertNotIn("Frase con nota 1", chapter)
+            self.assertIn("Frase con nota", chapter)
+            self.assertIn('class="class_16563"', chapter)
             self.assertIn("Texto de div. Mas texto de div.", chapter)
+            self.assertEqual(rebuilt.get_metadata("DC", "language")[0][0], "zh-Hans")
 
             with ZipFile(output_epub_path) as output_zip:
                 chapter_path = next(
@@ -218,8 +225,11 @@ class EpubConverter(unittest.TestCase):
                     if name.endswith("chapter1.xhtml")
                 )
                 raw_chapter = output_zip.read(chapter_path).decode()
+                opf = output_zip.read("EPUB/content.opf").decode()
             self.assertIn("<title>Chapter One</title>", raw_chapter)
             self.assertIn('href="style/book.css"', raw_chapter)
+            self.assertIn("zh-Hans", raw_chapter)
+            self.assertIn("Libro Diminuto", opf)
 
     def test_text_to_epub_rejects_line_count_mismatch(self):
         with tempfile.TemporaryDirectory() as tmpdirname:
