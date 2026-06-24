@@ -1,6 +1,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import shutil
 from typing import List, Optional
@@ -323,7 +324,6 @@ def main(
         raise ValueError("--llm_chunk_chars must be greater than 0.")
 
     gen_kwargs = {
-        "max_new_tokens": max_length,
         "num_beams": num_beams,
         "num_return_sequences": num_return_sequences,
         "do_sample": do_sample,
@@ -380,6 +380,7 @@ def main(
             f"Keep tokenization spaces: {keep_tokenization_spaces}\n"
         )
         print("** Generation parameters **")
+        print(f"max_new_tokens: dynamic <= {max_length}")
         print("\n".join(f"{k}: {v}" for k, v in gen_kwargs.items()))
         print("\n")
 
@@ -420,15 +421,42 @@ def main(
                 return_tensors="pt",
             )
 
-        def generate_prompts(prompt_texts, enforce_input_budget=True):
+        def source_token_count(source_text):
+            tokenized = tokenizer(
+                source_text,
+                add_special_tokens=False,
+                truncation=False,
+            )
+            input_ids = tokenized["input_ids"]
+            if hasattr(input_ids, "tolist"):
+                input_ids = input_ids.tolist()
+            if isinstance(input_ids, int):
+                return 1
+            if input_ids and isinstance(input_ids[0], list):
+                input_ids = input_ids[0]
+            return len(input_ids)
+
+        def dynamic_max_new_tokens(source_text, group_size=1):
+            source_tokens = source_token_count(source_text)
+            minimum = min(64, max_length)
+            budget = math.ceil(source_tokens * 1.6) + 32 + 8 * group_size
+            return min(max_length, max(minimum, budget))
+
+        def generate_prompts(
+            prompt_texts,
+            enforce_input_budget=True,
+            max_new_tokens=None,
+        ):
             batch = build_llm_batch(
                 prompt_texts,
                 enforce_input_budget=enforce_input_budget,
             )
             batch = {key: value.to(accelerator.device) for key, value in batch.items()}
+            generation_kwargs = dict(gen_kwargs)
+            generation_kwargs["max_new_tokens"] = max_new_tokens or max_length
             generated_tokens = accelerator.unwrap_model(prepared_model).generate(
                 **batch,
-                **gen_kwargs,
+                **generation_kwargs,
             )
             generated_tokens = generated_tokens[:, batch["input_ids"].shape[1] :]
             return tokenizer.batch_decode(
@@ -459,14 +487,18 @@ def main(
             )
             return format_terminology_section(relevant_entries)
 
-        def build_prompt_for_group(group):
+        def build_group_text(group):
+            return build_numbered_text(source_lines[index] for index in group)
+
+        def build_prompt_for_group(group, text=None):
             context = build_context(
                 source_lines,
                 start_index=group[0],
                 end_index=group[-1],
                 window=context_window,
             )
-            text = build_numbered_text(source_lines[index] for index in group)
+            if text is None:
+                text = build_group_text(group)
             terminology_section = terminology_section_for(text, context)
             return build_llm_prompt(
                 text=text,
@@ -494,7 +526,8 @@ def main(
         )
 
         def build_group_record(group):
-            prompt_text = build_prompt_for_group(group)
+            source_text = build_group_text(group)
+            prompt_text = build_prompt_for_group(group, source_text)
             token_count = prompt_token_count(prompt_text)
             if token_count > llm_input_max_length and len(group) > 1:
                 raise ValueError(
@@ -506,6 +539,11 @@ def main(
                 "group": group,
                 "prompt": prompt_text if token_count <= llm_input_max_length else None,
                 "token_count": token_count,
+                "source_tokens": source_token_count(source_text),
+                "max_new_tokens": dynamic_max_new_tokens(
+                    source_text,
+                    group_size=len(group),
+                ),
             }
 
         group_records = [build_group_record(group) for group in groups]
@@ -531,7 +569,10 @@ def main(
                 terminology_section=terminology_section_for(full_text, context),
             )
             if prompt_fits_budget(full_prompt):
-                decoded_output = generate_prompts([full_prompt])[0]
+                decoded_output = generate_prompts(
+                    [full_prompt],
+                    max_new_tokens=dynamic_max_new_tokens(full_text, group_size=1),
+                )[0]
                 try:
                     return parse_numbered_translations(
                         decoded_output,
@@ -586,8 +627,17 @@ def main(
             )
             translated_chunks = []
             for chunk_group in chunk_groups:
+                chunk_text = build_numbered_text(
+                    chunks[chunk_index] for chunk_index in chunk_group
+                )
                 prompt_text = build_chunk_group_prompt(chunk_group)
-                decoded_output = generate_prompts([prompt_text])[0]
+                decoded_output = generate_prompts(
+                    [prompt_text],
+                    max_new_tokens=dynamic_max_new_tokens(
+                        chunk_text,
+                        group_size=len(chunk_group),
+                    ),
+                )[0]
                 try:
                     parsed_chunks = parse_numbered_translations(
                         decoded_output,
@@ -605,7 +655,15 @@ def main(
                             prompt_template=llm_prompt,
                             terminology_section=terminology_section_for(chunk_text, ""),
                         )
-                        parsed_chunks.append(generate_prompts([chunk_prompt])[0].strip())
+                        parsed_chunks.append(
+                            generate_prompts(
+                                [chunk_prompt],
+                                max_new_tokens=dynamic_max_new_tokens(
+                                    chunk_text,
+                                    group_size=1,
+                                ),
+                            )[0].strip()
+                        )
                 translated_chunks.extend(parsed_chunks)
             return " ".join(chunk.strip() for chunk in translated_chunks if chunk.strip())
 
@@ -622,8 +680,12 @@ def main(
                         record for record in batch_records if record["prompt"] is not None
                     ]
                     if ready_records:
+                        batch_max_new_tokens = max(
+                            record["max_new_tokens"] for record in ready_records
+                        )
                         decoded_outputs = generate_prompts(
-                            [record["prompt"] for record in ready_records]
+                            [record["prompt"] for record in ready_records],
+                            max_new_tokens=batch_max_new_tokens,
                         )
                     else:
                         decoded_outputs = []

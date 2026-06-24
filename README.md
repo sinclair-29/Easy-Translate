@@ -146,7 +146,8 @@ Disable this step with `--disable_auto_terms`.
 - `--precision`: `bf16`, `fp16`, `32`, `8`, or `4`.
 - `--starting_batch_size`: starts at `1` by default and is reduced automatically
   if an OOM occurs.
-- `--max_length`: maximum newly generated tokens per LLM call.
+- `--max_length`: hard upper limit for the dynamic newly generated token
+  budget per LLM call.
 - `--context_window`: neighboring source blocks passed as context.
 - `--merge_small_blocks`: groups neighboring short blocks into numbered LLM
   calls while preserving output line count.
