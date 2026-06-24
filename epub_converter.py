@@ -105,23 +105,40 @@ def require_epub_dependencies() -> None:
         raise ImportError(EPUB_DEPENDENCY_MESSAGE)
 
 
+def _content_to_text(content) -> str:
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    return str(content)
+
+
+def _ensure_epub_namespace(content) -> str:
+    text = _content_to_text(content)
+    if "epub:" not in text or "xmlns:epub" in text:
+        return text
+    return re.sub(
+        r"(<html\b(?![^>]*\bxmlns:epub=)[^>]*)(>)",
+        r'\1 xmlns:epub="http://www.idpf.org/2007/ops"\2',
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
 def _parse_html(content):
     if XMLParsedAsHTMLWarning is None:
-        return BeautifulSoup(content, "lxml")
+        return BeautifulSoup(_ensure_epub_namespace(content), "lxml")
     import warnings
 
-    if isinstance(content, bytes):
-        probe = content[:512].lower()
-    else:
-        probe = str(content[:512]).lower()
-    if b"<?xml" in probe if isinstance(probe, bytes) else "<?xml" in probe:
-        return BeautifulSoup(content, "xml")
-    if b"xmlns=" in probe if isinstance(probe, bytes) else "xmlns=" in probe:
-        return BeautifulSoup(content, "xml")
+    safe_content = _ensure_epub_namespace(content)
+    probe = safe_content[:512].lower()
+    if "<?xml" in probe:
+        return BeautifulSoup(safe_content, "xml")
+    if "xmlns=" in probe:
+        return BeautifulSoup(safe_content, "xml")
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-        return BeautifulSoup(content, "lxml")
+        return BeautifulSoup(safe_content, "lxml")
 
 
 def _parse_legacy_html(content):

@@ -62,6 +62,25 @@ class LinkPreservingReplacement(unittest.TestCase):
         self.assertIn("<a", str(block))
 
 
+@unittest.skipIf(epub_converter.BeautifulSoup is None, "BeautifulSoup is not installed")
+class XhtmlParsing(unittest.TestCase):
+    def test_epub_namespace_is_added_before_xml_parsing(self):
+        soup = epub_converter._parse_html(
+            b"""<?xml version="1.0" encoding="utf-8"?>
+            <html xmlns="http://www.w3.org/1999/xhtml">
+              <body><section epub:type="titlepage"><h1>Hello</h1></section></body>
+            </html>"""
+        )
+
+        epub_converter._set_xhtml_language(soup, "zh-Hans")
+        serialized = epub_converter._serialized_xhtml(soup).decode("utf-8")
+
+        self.assertIn('xmlns:epub="http://www.idpf.org/2007/ops"', serialized)
+        self.assertIn('epub:type="titlepage"', serialized)
+        self.assertIn("<h1>Hello</h1>", serialized)
+        self.assertNotEqual(serialized.strip(), '<?xml version="1.0" encoding="utf-8"?>')
+
+
 @unittest.skipUnless(HAS_EPUB_DEPS, "EPUB dependencies are not installed")
 class EpubConverter(unittest.TestCase):
     def create_book(self, path):
