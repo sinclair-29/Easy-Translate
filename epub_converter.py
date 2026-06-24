@@ -4,20 +4,22 @@ import posixpath
 import re
 import tempfile
 import xml.etree.ElementTree as ET
-from typing import Dict, Iterable, List
+from functools import lru_cache
+from typing import Dict, Iterable, List, Tuple
 from zipfile import ZipFile
 
 
 try:
     import ebooklib
     import lxml
-    from bs4 import BeautifulSoup, NavigableString
+    from bs4 import BeautifulSoup, NavigableString, XMLParsedAsHTMLWarning
     from ebooklib import epub
 except ImportError:  # pragma: no cover - exercised through require_epub_dependencies
     ebooklib = None
     lxml = None
     BeautifulSoup = None
     NavigableString = None
+    XMLParsedAsHTMLWarning = None
     epub = None
 
 
@@ -101,6 +103,20 @@ LINK_PRESERVING_TAGS = {
 def require_epub_dependencies() -> None:
     if ebooklib is None or lxml is None or BeautifulSoup is None or epub is None:
         raise ImportError(EPUB_DEPENDENCY_MESSAGE)
+
+
+def _parse_html(content):
+    if XMLParsedAsHTMLWarning is None:
+        return BeautifulSoup(content, "lxml")
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+        return BeautifulSoup(content, "lxml")
+
+
+def _parse_xml(content):
+    return BeautifulSoup(content, "xml")
 
 
 def _normalize_text(text: str) -> str:
@@ -306,7 +322,7 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
 
     for item in _document_items_in_reading_order(book):
         content = item.get_content()
-        soup = BeautifulSoup(content, "lxml")
+        soup = _parse_html(content)
         blocks = []
         candidates = list(_iter_translatable_text_nodes(soup))
         extraction_mode = "text_nodes"
@@ -482,7 +498,7 @@ def _append_epub_metadata_units(
         if nav_href:
             nav_path = posixpath.normpath(posixpath.join(root_dir, nav_href))
             if nav_path in epub_zip.namelist():
-                nav_soup = BeautifulSoup(epub_zip.read(nav_path), "lxml")
+                nav_soup = _parse_html(epub_zip.read(nav_path))
                 for index, node in enumerate(_iter_translatable_text_nodes(nav_soup)):
                     _append_translation_unit(
                         manifest["metadata"],
@@ -605,9 +621,10 @@ def _apply_metadata_replacements(
         if zip_name not in epub_zip.namelist():
             continue
         parser = "xml" if zip_name.endswith((".opf", ".ncx")) else "lxml"
-        soup = BeautifulSoup(
-            replacements.get(zip_name, epub_zip.read(zip_name)),
-            parser,
+        soup = (
+            _parse_xml(replacements.get(zip_name, epub_zip.read(zip_name)))
+            if parser == "xml"
+            else _parse_html(replacements.get(zip_name, epub_zip.read(zip_name)))
         )
         for unit in units:
             translated_text = _translated_text_for_unit(unit, translated_lines)
@@ -643,16 +660,59 @@ def _apply_language_and_css_replacements(
 ) -> None:
     for zip_name in epub_zip.namelist():
         if zip_name.endswith((".xhtml", ".html")):
-            soup = BeautifulSoup(
-                replacements.get(zip_name, epub_zip.read(zip_name)),
-                "lxml",
-            )
+            soup = _parse_html(replacements.get(zip_name, epub_zip.read(zip_name)))
             _set_xhtml_language(soup, language_code)
             replacements[zip_name] = str(soup).encode("utf-8")
         elif zip_name.endswith(".css"):
             replacements[zip_name] = _append_chinese_css_overrides(
                 replacements.get(zip_name, epub_zip.read(zip_name))
             )
+
+
+def _blocks_for_manifest_item(soup: BeautifulSoup, extraction_mode: str) -> List:
+    if extraction_mode == "text_nodes":
+        return list(_iter_translatable_text_nodes(soup))
+    return list(_iter_translatable_blocks(soup))
+
+
+@lru_cache(maxsize=16)
+def _fallback_item_content(original_epub_path: str, item_id: str):
+    book = epub.read_epub(original_epub_path)
+    item = book.get_item_with_id(item_id)
+    if item is None:
+        return None
+    return item.get_content()
+
+
+def _soup_and_blocks_for_rebuild(
+    original_epub_path: str,
+    epub_zip: ZipFile,
+    zip_name: str,
+    manifest_item: Dict,
+) -> Tuple[BeautifulSoup, List]:
+    extraction_mode = manifest_item.get("extraction_mode", "blocks")
+    expected_count = len(manifest_item["blocks"])
+
+    raw_soup = _parse_html(epub_zip.read(zip_name))
+    raw_blocks = _blocks_for_manifest_item(raw_soup, extraction_mode)
+    if len(raw_blocks) == expected_count:
+        return raw_soup, raw_blocks
+
+    fallback_content = _fallback_item_content(
+        original_epub_path,
+        manifest_item["item_id"],
+    )
+    if fallback_content is not None:
+        fallback_soup = _parse_html(fallback_content)
+        fallback_blocks = _blocks_for_manifest_item(fallback_soup, extraction_mode)
+        if len(fallback_blocks) == expected_count:
+            return fallback_soup, fallback_blocks
+
+    raise ValueError(
+        "EPUB structure changed while rebuilding "
+        f"{manifest_item['file_name']}: expected {expected_count} blocks, "
+        f"found {len(raw_blocks)}"
+    )
 
 
 def text_to_epub(
@@ -690,18 +750,13 @@ def text_to_epub(
                 manifest_item["file_name"],
                 root_dir,
             )
-            soup = BeautifulSoup(epub_zip.read(zip_name), "lxml")
             extraction_mode = manifest_item.get("extraction_mode", "blocks")
-            if extraction_mode == "text_nodes":
-                blocks = list(_iter_translatable_text_nodes(soup))
-            else:
-                blocks = list(_iter_translatable_blocks(soup))
-            if len(blocks) != len(manifest_item["blocks"]):
-                raise ValueError(
-                    "EPUB structure changed while rebuilding "
-                    f"{manifest_item['file_name']}: expected "
-                    f"{len(manifest_item['blocks'])} blocks, found {len(blocks)}"
-                )
+            soup, blocks = _soup_and_blocks_for_rebuild(
+                original_epub_path,
+                epub_zip,
+                zip_name,
+                manifest_item,
+            )
 
             for block, block_info in zip(blocks, manifest_item["blocks"]):
                 translated_text = _translated_text_for_unit(block_info, translated_lines)
