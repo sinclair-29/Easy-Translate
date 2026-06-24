@@ -124,6 +124,16 @@ def _parse_html(content):
         return BeautifulSoup(content, "lxml")
 
 
+def _parse_legacy_html(content):
+    if XMLParsedAsHTMLWarning is None:
+        return BeautifulSoup(content, "lxml")
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+        return BeautifulSoup(content, "lxml")
+
+
 def _parse_xml(content):
     return BeautifulSoup(content, "xml")
 
@@ -611,6 +621,36 @@ def _set_xhtml_language(soup: BeautifulSoup, language_code: str) -> None:
                 break
 
 
+def _serialized_xhtml(soup: BeautifulSoup) -> bytes:
+    html = soup.find("html")
+    body = soup.find("body")
+    first_body_text = ""
+    if body is not None:
+        for child in body.contents:
+            if isinstance(child, NavigableString) and str(child).strip():
+                first_body_text = str(child).strip().lower()
+                break
+
+    if html is not None and body is not None and "?xml" in first_body_text:
+        body_children = []
+        for child in body.contents:
+            if isinstance(child, NavigableString) and "?xml" in str(child).lower():
+                continue
+            body_children.append(str(child))
+        attrs = dict(html.attrs)
+        attrs.setdefault("xmlns", "http://www.w3.org/1999/xhtml")
+        body_markup = "".join(body_children)
+        if "epub:" in body_markup:
+            attrs["xmlns:epub"] = "http://www.idpf.org/2007/ops"
+        attr_text = " ".join(f'{key}="{value}"' for key, value in attrs.items())
+        return (
+            f'<?xml version="1.0" encoding="utf-8"?>\n'
+            f"<html {attr_text}><body>{body_markup}</body></html>"
+        ).encode("utf-8")
+
+    return str(soup).encode("utf-8")
+
+
 def _append_chinese_css_overrides(content: bytes) -> bytes:
     text = content.decode("utf-8", errors="replace")
     if CHINESE_STYLE_ID in text:
@@ -663,7 +703,7 @@ def _apply_metadata_replacements(
             language_tag.clear()
             language_tag.append(language_code)
         _set_xhtml_language(soup, language_code)
-        replacements[zip_name] = str(soup).encode("utf-8")
+        replacements[zip_name] = _serialized_xhtml(soup)
 
 
 def _apply_language_and_css_replacements(
@@ -675,7 +715,7 @@ def _apply_language_and_css_replacements(
         if zip_name.endswith((".xhtml", ".html")):
             soup = _parse_html(replacements.get(zip_name, epub_zip.read(zip_name)))
             _set_xhtml_language(soup, language_code)
-            replacements[zip_name] = str(soup).encode("utf-8")
+            replacements[zip_name] = _serialized_xhtml(soup)
         elif zip_name.endswith(".css"):
             replacements[zip_name] = _append_chinese_css_overrides(
                 replacements.get(zip_name, epub_zip.read(zip_name))
@@ -706,10 +746,16 @@ def _soup_and_blocks_for_rebuild(
     extraction_mode = manifest_item.get("extraction_mode", "blocks")
     expected_count = len(manifest_item["blocks"])
 
-    raw_soup = _parse_html(epub_zip.read(zip_name))
+    raw_content = epub_zip.read(zip_name)
+    raw_soup = _parse_html(raw_content)
     raw_blocks = _blocks_for_manifest_item(raw_soup, extraction_mode)
     if len(raw_blocks) == expected_count:
         return raw_soup, raw_blocks
+
+    legacy_soup = _parse_legacy_html(raw_content)
+    legacy_blocks = _blocks_for_manifest_item(legacy_soup, extraction_mode)
+    if len(legacy_blocks) == expected_count:
+        return legacy_soup, legacy_blocks
 
     fallback_content = _fallback_item_content(
         original_epub_path,
@@ -720,6 +766,14 @@ def _soup_and_blocks_for_rebuild(
         fallback_blocks = _blocks_for_manifest_item(fallback_soup, extraction_mode)
         if len(fallback_blocks) == expected_count:
             return fallback_soup, fallback_blocks
+
+        fallback_legacy_soup = _parse_legacy_html(fallback_content)
+        fallback_legacy_blocks = _blocks_for_manifest_item(
+            fallback_legacy_soup,
+            extraction_mode,
+        )
+        if len(fallback_legacy_blocks) == expected_count:
+            return fallback_legacy_soup, fallback_legacy_blocks
 
     raise ValueError(
         "EPUB structure changed while rebuilding "
@@ -785,7 +839,7 @@ def text_to_epub(
                     block.clear()
                     block.append(translated_text)
 
-            replacements[zip_name] = str(soup).encode("utf-8")
+            replacements[zip_name] = _serialized_xhtml(soup)
 
         _apply_metadata_replacements(
             replacements,
