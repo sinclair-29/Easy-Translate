@@ -43,6 +43,7 @@ def load_model_for_inference(
     torch_dtype: Optional[str] = None,
     force_auto_device_map: bool = False,
     trust_remote_code: bool = False,
+    attn_implementation: Optional[str] = None,
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     """
     Load an instruction-tuned causal language model for inference.
@@ -68,6 +69,10 @@ def load_model_for_inference(
             into each GPU. Defaults to False.
         trust_remote_code (`bool`, optional):
             Trust the remote code from HuggingFace model hub. Defaults to False.
+        attn_implementation (`Optional[str]`, optional):
+            HuggingFace attention implementation to use, such as
+            "flash_attention_2" or "sdpa". Defaults to `None`, which keeps the
+            Transformers default behavior.
 
     Returns:
         `Tuple[PreTrainedModel, PreTrainedTokenizerBase]`:
@@ -149,14 +154,18 @@ def load_model_for_inference(
         print(
             f"Model {weights_path} is a causal language model. We will load it as a CausalLM model."
         )
-        model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=weights_path,
-            device_map="auto" if force_auto_device_map else None,
-            torch_dtype=torch_dtype,
-            trust_remote_code=trust_remote_code,
-            quantization_config=bnb_config,
+        model_kwargs = {
+            "pretrained_model_name_or_path": weights_path,
+            "device_map": "auto" if force_auto_device_map else None,
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": trust_remote_code,
+            "quantization_config": bnb_config,
             **quant_args,
-        )
+        }
+        if attn_implementation is not None:
+            model_kwargs["attn_implementation"] = attn_implementation
+
+        model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(**model_kwargs)
 
         # Ensure that the padding token is added to the left of the input sequence.
         tokenizer.padding_side = "left"

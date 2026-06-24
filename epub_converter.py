@@ -54,6 +54,8 @@ BLOCK_TAGS = (
 
 DEFAULT_TRANSLATED_EPUB_LANGUAGE = "zh-Hans"
 CHINESE_STYLE_ID = "easytranslate-chinese-style"
+ZH_BODY_CLASS = "easytranslate-zh-body"
+NOTEREF_CLASS = "easytranslate-noteref"
 CHINESE_STYLE = """
 html[lang|="zh"], body {
   text-align: start;
@@ -63,9 +65,22 @@ p, div, li, blockquote, dd, dt, td, th {
   text-align: start;
   word-break: break-word;
 }
-a[style*="vertical-align: super"],
-a[class] {
+.easytranslate-zh-body {
+  text-indent: 2em;
+  text-align: start;
+  hyphens: none;
+  -webkit-hyphens: none;
+}
+a.noteref,
+a.easytranslate-noteref,
+a[epub\\:type~="noteref"] {
+  color: #0645ad;
+  font-size: 0.75em;
+  line-height: 1;
+  vertical-align: super;
   text-decoration: none;
+  text-indent: 0;
+  padding: 0 0.15em;
 }
 """.strip()
 EXCLUDED_TEXT_PARENTS = {
@@ -78,6 +93,8 @@ EXCLUDED_TEXT_PARENTS = {
     "title",
 }
 NOTE_LINK_CLASSES = {
+    "noteref",
+    NOTEREF_CLASS,
     "class_16563",
     "class_16588",
     "class_16870",
@@ -422,17 +439,101 @@ def _is_numeric_text(text: str) -> bool:
     return bool(re.fullmatch(r"[\[\(]?\d{1,4}[\]\)]?", _normalize_text(text)))
 
 
-def _is_structural_note_link(tag) -> bool:
-    if tag is None or getattr(tag, "name", None) != "a":
+def _tag_classes(tag) -> set:
+    classes = tag.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    return {str(value).lower() for value in classes}
+
+
+def _epub_type_values(tag) -> set:
+    values = []
+    for attr in ("epub:type", "type"):
+        value = tag.get(attr)
+        if value:
+            values.extend(str(value).lower().split())
+    return set(values)
+
+
+def _is_noteref_link(tag) -> bool:
+    if tag is None or _local_tag_name(tag) != "a":
         return False
     text = _normalize_text(tag.get_text("", strip=True))
     if not _is_numeric_text(text):
         return False
-    classes = set(tag.get("class") or [])
-    if classes & NOTE_LINK_CLASSES:
+    classes = _tag_classes(tag)
+    epub_types = _epub_type_values(tag)
+    href = str(tag.get("href", "")).lower()
+    link_context = " ".join(
+        str(value).lower()
+        for value in (
+            tag.get("id", ""),
+            tag.get("role", ""),
+            href,
+        )
+        if value
+    )
+    return (
+        bool(classes & NOTE_LINK_CLASSES)
+        or "noteref" in epub_types
+        or "footnote" in epub_types
+        or "endnote" in epub_types
+        or ("#" in href and any(hint in link_context for hint in NOTE_HINTS))
+    )
+
+
+def _is_structural_note_link(tag) -> bool:
+    if tag is None or _local_tag_name(tag) != "a":
+        return False
+    text = _normalize_text(tag.get_text("", strip=True))
+    if not _is_numeric_text(text):
+        return False
+    if _is_noteref_link(tag):
         return True
     href = tag.get("href", "")
     return "#" in href and len(text) <= 4
+
+
+def _ensure_noteref_class(tag) -> None:
+    if not _is_noteref_link(tag):
+        return
+    _ensure_tag_class(tag, NOTEREF_CLASS)
+
+
+def _ensure_tag_class(tag, class_name: str) -> None:
+    classes = tag.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    classes = list(classes)
+    if class_name not in classes:
+        classes.append(class_name)
+    tag["class"] = classes
+
+
+def _apply_noteref_classes(block) -> None:
+    for link in block.find_all(lambda tag: _is_noteref_link(tag)):
+        _ensure_noteref_class(link)
+
+
+def _apply_chinese_body_class(block, block_info: Dict) -> None:
+    if block_info.get("kind", "body") != "body":
+        return
+    if _local_tag_name(block) != "p":
+        return
+    _ensure_tag_class(block, ZH_BODY_CLASS)
+
+
+def _last_noteref_link(block):
+    links = block.find_all(lambda tag: _is_noteref_link(tag))
+    return links[-1] if links else None
+
+
+def _strip_duplicate_block_note_number(text: str, block) -> str:
+    note_link = _last_noteref_link(block)
+    if note_link is None:
+        return text
+    note_number = re.escape(_normalize_text(note_link.get_text("", strip=True)))
+    return re.sub(rf"(?<!\d)\s*{note_number}\s*$", "", text).rstrip()
 
 
 def _strip_duplicate_note_number(text: str, next_node) -> str:
@@ -450,7 +551,7 @@ def _strip_duplicate_note_number(text: str, next_node) -> str:
             continue
         if _is_structural_note_link(sibling):
             note_number = re.escape(_normalize_text(sibling.get_text("", strip=True)))
-            return re.sub(rf"\s*{note_number}\s*$", "", text).rstrip()
+            return re.sub(rf"(?<!\d)\s*{note_number}\s*$", "", text).rstrip()
         return text
     return text
 
@@ -603,6 +704,96 @@ def _manifest_item_hrefs(opf_content: bytes) -> Dict[str, str]:
     return items
 
 
+def _opf_manifest_items(opf_content: bytes) -> List[Dict[str, str]]:
+    root = ET.fromstring(opf_content)
+    items = []
+    for element in root.iter():
+        if element.tag.endswith("item"):
+            item_id = element.attrib.get("id", "")
+            href = element.attrib.get("href", "")
+            if not item_id or not href:
+                continue
+            items.append(
+                {
+                    "id": item_id,
+                    "href": href,
+                    "media_type": element.attrib.get("media-type", ""),
+                    "properties": element.attrib.get("properties", ""),
+                }
+            )
+    return items
+
+
+def _opf_spine_toc_id(opf_content: bytes) -> str:
+    root = ET.fromstring(opf_content)
+    for element in root.iter():
+        if element.tag.endswith("spine"):
+            return element.attrib.get("toc", "")
+    return ""
+
+
+def _dedupe_preserving_order(values: Iterable[str]) -> List[str]:
+    seen = set()
+    deduped = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
+
+
+def _metadata_item_path(root_dir: str, href: str) -> str:
+    return posixpath.normpath(posixpath.join(root_dir, href))
+
+
+def _ncx_paths_from_opf(opf_content: bytes, root_dir: str) -> List[str]:
+    items = _opf_manifest_items(opf_content)
+    items_by_id = {item["id"]: item for item in items}
+    candidate_hrefs = []
+
+    spine_toc_id = _opf_spine_toc_id(opf_content)
+    if spine_toc_id in items_by_id:
+        candidate_hrefs.append(items_by_id[spine_toc_id]["href"])
+
+    for item in items:
+        item_id = item["id"].lower()
+        href = item["href"]
+        media_type = item["media_type"].lower()
+        if (
+            media_type == "application/x-dtbncx+xml"
+            or href.lower().endswith(".ncx")
+            or item_id in {"toc", "ncx"}
+        ):
+            candidate_hrefs.append(href)
+
+    return _dedupe_preserving_order(
+        _metadata_item_path(root_dir, href) for href in candidate_hrefs
+    )
+
+
+def _nav_paths_from_opf(opf_content: bytes, root_dir: str) -> List[str]:
+    candidate_hrefs = []
+    for item in _opf_manifest_items(opf_content):
+        item_id = item["id"].lower()
+        href = item["href"]
+        href_name = posixpath.basename(href).lower()
+        media_type = item["media_type"].lower()
+        properties = set(item["properties"].lower().split())
+        if (
+            "nav" in properties
+            or item_id == "nav"
+            or (
+                media_type == "application/xhtml+xml"
+                and href_name in {"nav.xhtml", "nav.html", "toc.xhtml", "toc.html"}
+            )
+        ):
+            candidate_hrefs.append(href)
+
+    return _dedupe_preserving_order(
+        _metadata_item_path(root_dir, href) for href in candidate_hrefs
+    )
+
+
 def _append_translation_unit(
     manifest_units: List[Dict],
     lines: List[str],
@@ -650,10 +841,7 @@ def _append_epub_metadata_units(
                 zip_name=opf_path,
             )
 
-        item_hrefs = _manifest_item_hrefs(opf_content)
-        toc_href = item_hrefs.get("toc")
-        if toc_href:
-            ncx_path = posixpath.normpath(posixpath.join(root_dir, toc_href))
+        for ncx_path in _ncx_paths_from_opf(opf_content, root_dir):
             if ncx_path in epub_zip.namelist():
                 ncx_soup = BeautifulSoup(epub_zip.read(ncx_path), "xml")
                 for index, label in enumerate(_find_all_tags(ncx_soup, "navLabel")):
@@ -670,13 +858,7 @@ def _append_epub_metadata_units(
                         index=index,
                     )
 
-        nav_href = None
-        for item_id, href in item_hrefs.items():
-            if item_id.lower() == "nav":
-                nav_href = href
-                break
-        if nav_href:
-            nav_path = posixpath.normpath(posixpath.join(root_dir, nav_href))
+        for nav_path in _nav_paths_from_opf(opf_content, root_dir):
             if nav_path in epub_zip.namelist():
                 nav_soup = _parse_html(epub_zip.read(nav_path))
                 for index, node in enumerate(_iter_translatable_text_nodes(nav_soup)):
@@ -1030,11 +1212,18 @@ def text_to_epub(
                         block.next_sibling,
                     )
                     block.replace_with(translated_text)
-                elif _has_linked_descendant(block):
-                    _replace_block_text_preserving_links(block, translated_text)
                 else:
-                    block.clear()
-                    block.append(translated_text)
+                    _apply_noteref_classes(block)
+                    _apply_chinese_body_class(block, block_info)
+                    translated_text = _strip_duplicate_block_note_number(
+                        translated_text,
+                        block,
+                    )
+                    if _has_linked_descendant(block):
+                        _replace_block_text_preserving_links(block, translated_text)
+                    else:
+                        block.clear()
+                        block.append(translated_text)
 
             _set_xhtml_language(soup, target_language_code)
             replacements[zip_name] = _serialized_xhtml(soup)

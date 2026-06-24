@@ -224,6 +224,7 @@ def main(
     repetition_penalty: float = None,
     prompt: str = None,
     trust_remote_code: bool = False,
+    attn_implementation: Optional[str] = None,
     llm_target_language: str = "Simplified Chinese",
     llm_prompt: str = None,
     context_window: int = 0,
@@ -283,6 +284,7 @@ def main(
         torch_dtype=dtype,
         force_auto_device_map=force_auto_device_map,
         trust_remote_code=trust_remote_code,
+        attn_implementation=attn_implementation,
     )
 
     if not is_llm_translation_model(model, tokenizer, model_name):
@@ -393,6 +395,7 @@ def main(
             f"Model: {model_name}\n"
             f"LoRA weights: {lora_weights_name_or_path}\n"
             f"Force auto device map: {force_auto_device_map}\n"
+            f"Attention implementation: {attn_implementation}\n"
             f"Keep special tokens: {keep_special_tokens}\n"
             f"Keep tokenization spaces: {keep_tokenization_spaces}\n"
         )
@@ -1023,6 +1026,14 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default=None,
+        choices=["flash_attention_2", "sdpa"],
+        help="Optional HuggingFace attention implementation for CausalLM loading.",
+    )
+
+    parser.add_argument(
         "--llm_target_language",
         type=str,
         default="Simplified Chinese",
@@ -1107,6 +1118,7 @@ if __name__ == "__main__":
         repetition_penalty=args.repetition_penalty,
         prompt=args.prompt,
         trust_remote_code=args.trust_remote_code,
+        attn_implementation=args.attn_implementation,
         llm_target_language=args.llm_target_language,
         llm_prompt=args.llm_prompt,
         context_window=args.context_window,

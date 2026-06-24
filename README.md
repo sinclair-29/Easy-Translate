@@ -144,6 +144,9 @@ Disable this step with `--disable_auto_terms`.
 - `--model_name`: local path or Hugging Face model name for an instruction-tuned
   CausalLM/chat model.
 - `--precision`: `bf16`, `fp16`, `32`, `8`, or `4`.
+- `--attn_implementation`: optional HuggingFace attention implementation.
+  Use `flash_attention_2` when FlashAttention-2 is installed, or `sdpa` as the
+  safer built-in PyTorch option.
 - `--starting_batch_size`: starts at `1` by default and is reduced automatically
   if an OOM occurs.
 - `--max_length`: hard upper limit for the dynamic newly generated token
