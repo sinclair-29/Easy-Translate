@@ -19,6 +19,7 @@ WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]{2,}")
 URL_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
 URL_IN_TEXT_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 PUNCTUATION_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+FLAT_JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 DASH_TRANSLATION = str.maketrans(
     {
         "\u2010": "-",
@@ -295,7 +296,64 @@ def _extract_json_object(text: str) -> dict:
     end = stripped.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("Terminology response did not contain a JSON object.")
-    return json.loads(stripped[start : end + 1])
+    return _json_loads_with_repairs(stripped[start : end + 1])
+
+
+def _json_loads_with_repairs(text: str):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        repaired = _repair_common_json_issues(text)
+        return json.loads(repaired)
+
+
+def _repair_common_json_issues(text: str) -> str:
+    repaired = text.strip()
+    repaired = repaired.replace("\ufeff", "")
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    repaired = re.sub(r"}\s*{", "}, {", repaired)
+    repaired = re.sub(
+        r'("source"\s*:\s*"(?:\\.|[^"\\])*")\s+("target"\s*:)',
+        r"\1, \2",
+        repaired,
+    )
+    repaired = re.sub(
+        r'("target"\s*:\s*"(?:\\.|[^"\\])*")\s+("source"\s*:)',
+        r"\1, \2",
+        repaired,
+    )
+    return repaired
+
+
+def _parse_object_entries_fallback(text: str, limit: int) -> dict:
+    terms = []
+    proper_names = []
+    seen = set()
+    for match in FLAT_JSON_OBJECT_RE.finditer(text):
+        raw_object = match.group(0)
+        try:
+            entry = _json_loads_with_repairs(raw_object)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        source = str(entry.get("source", "")).strip()
+        target = str(entry.get("target", "")).strip()
+        if not source or not target:
+            continue
+        key = _normalize_key(source)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized_entry = {"source": source, "target": target}
+        section_prefix = text[: match.start()].lower()
+        if section_prefix.rfind("proper_names") > section_prefix.rfind("terms"):
+            proper_names.append(normalized_entry)
+        else:
+            terms.append(normalized_entry)
+        if len(terms) + len(proper_names) >= limit:
+            break
+    return {"terms": terms, "proper_names": proper_names}
 
 
 def _normalize_entries(entries, limit: int) -> List[dict]:
@@ -322,8 +380,18 @@ def _normalize_entries(entries, limit: int) -> List[dict]:
 
 
 def parse_terminology_memory(text: str, limit: int = DEFAULT_MEMORY_LIMIT) -> dict:
-    payload = _extract_json_object(text)
+    try:
+        payload = _extract_json_object(text)
+    except (ValueError, json.JSONDecodeError) as error:
+        fallback_memory = _parse_object_entries_fallback(text, limit)
+        if fallback_memory["terms"] or fallback_memory["proper_names"]:
+            return fallback_memory
+        raise error
+
     if not isinstance(payload, dict):
+        fallback_memory = _parse_object_entries_fallback(text, limit)
+        if fallback_memory["terms"] or fallback_memory["proper_names"]:
+            return fallback_memory
         raise ValueError("Terminology response JSON must be an object.")
 
     proper_names = _normalize_entries(payload.get("proper_names", []), limit)
