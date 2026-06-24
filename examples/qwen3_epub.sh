@@ -1,0 +1,11 @@
+python3 translate.py \
+  --sentences_path book.epub \
+  --output_path book_zh.epub \
+  --model_name /path/to/Qwen3-14B-Instruct \
+  --precision fp16 \
+  --starting_batch_size 1 \
+  --context_window 1 \
+  --merge_small_blocks \
+  --llm_input_max_length 8192 \
+  --llm_chunk_chars 4000 \
+  --max_length 1536

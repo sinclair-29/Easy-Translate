@@ -6,42 +6,6 @@ def count_lines(input_path: str) -> int:
         return sum(1 for _ in f)
 
 
-class DatasetReader(IterableDataset):
-    def __init__(self, filename, tokenizer, max_length=128, prompt: str = None):
-        self.filename = filename
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.current_line = 0
-        self.total_lines = count_lines(filename)
-        self.prompt = prompt
-        print(f"{self.total_lines} lines in {filename}")
-
-    def preprocess(self, text: str):
-        self.current_line += 1
-        text = text.strip()
-
-        if len(text) == 0:
-            print(f"Warning: empty sentence at line {self.current_line}")
-
-        if self.prompt is not None:
-            text = self.prompt.replace("%%SENTENCE%%", text)
-        return self.tokenizer(
-            text,
-            padding=False,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors=None,
-        )
-
-    def __iter__(self):
-        file_itr = open(self.filename, "r", encoding="utf8")
-        mapped_itr = map(self.preprocess, file_itr)
-        return mapped_itr
-
-    def __len__(self):
-        return self.total_lines
-
-
 class ParallelTextReader(IterableDataset):
     def __init__(self, pred_path: str, gold_path: str):
         self.pred_path = pred_path

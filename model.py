@@ -1,7 +1,6 @@
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    AutoModelForSeq2SeqLM,
     BitsAndBytesConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -9,7 +8,6 @@ from transformers import (
 
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
-    MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES,
 )
 
 from typing import Optional, Tuple
@@ -17,6 +15,25 @@ from typing import Optional, Tuple
 import torch
 
 import json
+
+
+UNSUPPORTED_SEQ2SEQ_MODEL_TYPES = {
+    "fsmt",
+    "m2m_100",
+    "marian",
+    "mbart",
+    "mt5",
+    "nllb",
+    "seamless_m4t",
+    "t5",
+}
+
+LLM_ONLY_MODEL_ERROR = (
+    "This fork/version of Easy-Translate is now LLM-only and expects an "
+    "instruction-tuned CausalLM/chat model such as Qwen3-14B-Instruct. "
+    "Legacy Seq2Seq translation models such as NLLB, M2M100, SeamlessM4T, "
+    "MBART, MarianMT, and T5 are no longer supported."
+)
 
 
 def load_model_for_inference(
@@ -28,7 +45,7 @@ def load_model_for_inference(
     trust_remote_code: bool = False,
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     """
-    Load any Decoder model for inference.
+    Load an instruction-tuned causal language model for inference.
 
     Args:
         weights_path (`str`):
@@ -57,7 +74,7 @@ def load_model_for_inference(
             The loaded model and tokenizer.
     """
 
-    if isinstance(quantization,str):
+    if isinstance(quantization, str):
         quantization = int(quantization)
     assert (quantization is None) or (
         quantization in [4, 8]
@@ -73,19 +90,14 @@ def load_model_for_inference(
         torch_dtype if torch_dtype in ["auto", None] else getattr(torch, torch_dtype)
     )
 
-    if "small100" in weights_path:
-        import transformers
+    model_type = str(getattr(config, "model_type", "")).lower()
+    if getattr(config, "is_encoder_decoder", False) or model_type in UNSUPPORTED_SEQ2SEQ_MODEL_TYPES:
+        raise ValueError(
+            f"Model {weights_path} has model_type={config.model_type!r}. "
+            f"{LLM_ONLY_MODEL_ERROR}"
+        )
 
-        if transformers.__version__ > "4.34.0":
-            raise ValueError(
-                "Small100 tokenizer is not supported in transformers > 4.34.0. Please "
-                "use transformers <= 4.34.0 if you want to use small100"
-            )
-
-        print("Loading custom small100 tokenizer for utils.tokenization_small100")
-        from utils.tokenization_small100 import SMALL100Tokenizer as AutoTokenizer
-    else:
-        from transformers import AutoTokenizer
+    from transformers import AutoTokenizer
 
     tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
         weights_path, add_eos_token=True, trust_remote_code=trust_remote_code
@@ -133,22 +145,9 @@ def load_model_for_inference(
         print(f"Loading model with dtype: {torch_dtype}")
         bnb_config = None
 
-    if config.model_type in MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES:
+    if config.model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
         print(
-            f"Model {weights_path} is a encoder-decoder model. We will load it as a Seq2SeqLM model."
-        )
-        model: PreTrainedModel = AutoModelForSeq2SeqLM.from_pretrained(
-            pretrained_model_name_or_path=weights_path,
-            device_map="auto" if force_auto_device_map else None,
-            torch_dtype=torch_dtype,
-            quantization_config=bnb_config,
-            trust_remote_code=trust_remote_code,
-            **quant_args,
-        )
-
-    elif config.model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-        print(
-            f"Model {weights_path} is an encoder-only model. We will load it as a CausalLM model."
+            f"Model {weights_path} is a causal language model. We will load it as a CausalLM model."
         )
         model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=weights_path,
@@ -163,10 +162,8 @@ def load_model_for_inference(
         tokenizer.padding_side = "left"
     else:
         raise ValueError(
-            f"Model {weights_path} of type {config.model_type} is not supported by EasyTranslate."
-            "Supported models are:\n"
-            f"Seq2SeqLM: {MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES}\n"
-            f"CausalLM: {MODEL_FOR_CAUSAL_LM_MAPPING_NAMES}\n"
+            f"Model {weights_path} of type {config.model_type} is not supported. "
+            f"{LLM_ONLY_MODEL_ERROR}"
         )
 
     if lora_weights_name_or_path:

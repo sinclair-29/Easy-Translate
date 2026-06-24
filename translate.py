@@ -1,20 +1,13 @@
 import argparse
 import glob
-import math
 import os
 import shutil
 from typing import Optional
 
 import torch
-from accelerate import Accelerator, DistributedType, find_executable_batch_size
-from torch.utils.data import DataLoader
+from accelerate import Accelerator, find_executable_batch_size
 from tqdm import tqdm
-from transformers import (
-    DataCollatorWithPadding,
-    PreTrainedTokenizerBase,
-)
 
-from dataset import DatasetReader, count_lines
 from epub_converter import epub_to_text, require_epub_dependencies, text_to_epub
 from llm_translation import (
     apply_chat_template_tokenized,
@@ -62,80 +55,12 @@ def get_epub_work_paths(input_path: str, output_path: str):
     }
 
 
-def get_epub_language_code(target_lang: Optional[str], llm_target_language: str) -> str:
-    if target_lang in {"zho_Hans", "zh", "zh_CN", "zh-Hans"}:
-        return "zh-Hans"
-    if target_lang in {"zho_Hant", "zh_TW", "zh-Hant"}:
-        return "zh-Hant"
+def get_epub_language_code(llm_target_language: str) -> str:
     if llm_target_language and "chinese" in llm_target_language.lower():
         if "traditional" in llm_target_language.lower():
             return "zh-Hant"
         return "zh-Hans"
-    return target_lang or "zh-Hans"
-
-
-def model_supports_language_tokens(model, tokenizer) -> bool:
-    return hasattr(tokenizer, "lang_code_to_id") or model.config.model_type in {
-        "m2m_100",
-    }
-
-
-def get_language_token_id(tokenizer, language: str):
-    if language is None:
-        return None
-    if hasattr(tokenizer, "lang_code_to_id"):
-        return tokenizer.lang_code_to_id.get(language)
-
-    token_id = tokenizer.convert_tokens_to_ids(language)
-    if token_id is None or token_id == tokenizer.unk_token_id:
-        return None
-    return token_id
-
-
-def describe_supported_languages(tokenizer):
-    if hasattr(tokenizer, "lang_code_to_id"):
-        return tokenizer.lang_code_to_id.keys()
-    return "language tokens in this tokenizer vocabulary"
-
-
-def get_dataloader(
-    accelerator: Accelerator,
-    filename: str,
-    tokenizer: PreTrainedTokenizerBase,
-    batch_size: int,
-    max_length: int,
-    prompt: str,
-) -> DataLoader:
-    dataset = DatasetReader(
-        filename=filename,
-        tokenizer=tokenizer,
-        max_length=max_length,
-        prompt=prompt,
-    )
-    if accelerator.distributed_type == DistributedType.XLA:
-        data_collator = DataCollatorWithPadding(
-            tokenizer,
-            padding="max_length",
-            max_length=max_length,
-            # label_pad_token_id=tokenizer.pad_token_id,
-            return_tensors="pt",
-        )
-    else:
-        data_collator = DataCollatorWithPadding(
-            tokenizer,
-            padding=True,
-            # label_pad_token_id=tokenizer.pad_token_id,
-            # max_length=max_length, No need to set max_length here, we already truncate in the preprocess function
-            # pad_to_multiple_of=8,
-            return_tensors="pt",
-        )
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        collate_fn=data_collator,
-        num_workers=0,  # Disable multiprocessing
-    )
+    return "zh-Hans"
 
 
 def main(
@@ -146,7 +71,7 @@ def main(
     source_lang: Optional[str],
     target_lang: Optional[str],
     starting_batch_size: Optional[int] = None,
-    model_name: str = "facebook/m2m100_1.2B",
+    model_name: str = "Qwen/Qwen3-14B-Instruct",
     lora_weights_name_or_path: str = None,
     force_auto_device_map: bool = False,
     precision: str = None,
@@ -222,19 +147,20 @@ def main(
         trust_remote_code=trust_remote_code,
     )
 
-    is_llm_translation = is_llm_translation_model(model, tokenizer, model_name)
+    if not is_llm_translation_model(model, tokenizer, model_name):
+        raise ValueError(
+            "This fork/version of Easy-Translate is LLM-only and expects an "
+            "instruction-tuned CausalLM/chat model. The loaded model does not look "
+            "like a supported chat/instruction translation model. Use a model such "
+            "as Qwen3-14B-Instruct, or provide a tokenizer with a chat template."
+        )
+
     if max_length is None:
-        max_length = 2048 if is_llm_translation else 256
+        max_length = 2048
     if num_beams is None:
-        num_beams = 1 if is_llm_translation else 5
+        num_beams = 1
     if starting_batch_size is None:
-        starting_batch_size = 1 if is_llm_translation else 128
-    if temperature is None and not is_llm_translation:
-        temperature = 0.8
-    if top_k is None and not is_llm_translation:
-        top_k = 100
-    if top_p is None and not is_llm_translation:
-        top_p = 0.75
+        starting_batch_size = 1
 
     if starting_batch_size <= 0:
         raise ValueError("--starting_batch_size must be greater than 0.")
@@ -251,43 +177,19 @@ def main(
             f"inference. You should consider using a smaller batch size, i.e '--starting_batch_size 8'"
         )
 
-    if is_llm_translation and num_return_sequences != 1:
+    if num_return_sequences != 1:
         raise ValueError("LLM translation mode requires --num_return_sequences 1.")
 
-    is_translation_model = (
-        False if is_llm_translation else model_supports_language_tokens(model, tokenizer)
-    )
-    lang_code_to_idx = None
-
-    if (
-        is_translation_model
-        and (source_lang is None or target_lang is None)
-        and "small100" not in model_name
-    ):
-        raise ValueError(
-            f"The model you are using requires a source and target language. "
-            f"Please specify them with --source-lang and --target-lang. "
-            f"The supported languages are: {describe_supported_languages(tokenizer)}"
+    if source_lang is not None or target_lang is not None:
+        print(
+            "WARNING: --source_lang and --target_lang are ignored in LLM-only mode. "
+            "Use --llm_target_language to choose the translation target."
         )
-    if not is_llm_translation and not is_translation_model and (
-        source_lang is not None or target_lang is not None
-    ):
-        if prompt is None:
-            print(
-                "WARNING: You are using a model that does not support source and target languages parameters "
-                "but you specified them. You probably want to use m2m100/nllb200 for translation or "
-                "set --prompt to define the task for you model. "
-            )
-        else:
-            print(
-                "WARNING: You are using a model that does not support source and target languages parameters "
-                "but you specified them."
-            )
 
-    if prompt is not None and "%%SENTENCE%%" not in prompt:
+    if prompt is not None:
         raise ValueError(
-            f"The prompt must contain the %%SENTENCE%% token to indicate where the sentence should be inserted. "
-            f"Your prompt: {prompt}"
+            "--prompt and the legacy %%SENTENCE%% prompting path are no longer "
+            "supported in LLM-only mode. Use --llm_prompt with a {TEXT} placeholder instead."
         )
     if llm_prompt is not None and "{TEXT}" not in llm_prompt:
         raise ValueError("The --llm_prompt argument must include the {TEXT} placeholder.")
@@ -300,54 +202,6 @@ def main(
     if llm_chunk_chars <= 0:
         raise ValueError("--llm_chunk_chars must be greater than 0.")
 
-    if is_translation_model and "small100" in model_name:
-        lang_code_to_idx = get_language_token_id(tokenizer, target_lang)
-        if lang_code_to_idx is None:
-            raise KeyError(
-                f"Language {target_lang} not found in tokenizer. Available languages: {describe_supported_languages(tokenizer)}"
-            )
-        tokenizer.tgt_lang = target_lang
-        # We don't need to force the BOS token, so we set is_translation_model to False
-        is_translation_model = False
-
-    if is_translation_model:
-        source_lang_idx = get_language_token_id(tokenizer, source_lang)
-        if source_lang_idx is None:
-            raise KeyError(
-                f"Language {source_lang} not found in tokenizer. Available languages: {describe_supported_languages(tokenizer)}"
-            )
-        tokenizer.src_lang = source_lang
-
-        lang_code_to_idx = get_language_token_id(tokenizer, target_lang)
-        if lang_code_to_idx is None:
-            raise KeyError(
-                f"Language {target_lang} not found in tokenizer. Available languages: {describe_supported_languages(tokenizer)}"
-            )
-
-    if model.config.model_type == "seamless_m4t":
-        # Loading a seamless_m4t model, we need to set a few things to ensure compatibility
-
-        supported_langs = tokenizer.additional_special_tokens
-        supported_langs = [lang.replace("__", "") for lang in supported_langs]
-
-        if source_lang is None or target_lang is None:
-            raise ValueError(
-                f"The model you are using requires a source and target language. "
-                f"Please specify them with --source-lang and --target-lang. "
-                f"The supported languages are: {supported_langs}"
-            )
-
-        if source_lang not in supported_langs:
-            raise ValueError(
-                f"Language {source_lang} not found in tokenizer. Available languages: {supported_langs}"
-            )
-        if target_lang not in supported_langs:
-            raise ValueError(
-                f"Language {target_lang} not found in tokenizer. Available languages: {supported_langs}"
-            )
-
-        tokenizer.src_lang = source_lang
-
     gen_kwargs = {
         "max_new_tokens": max_length,
         "num_beams": num_beams,
@@ -355,38 +209,26 @@ def main(
         "do_sample": do_sample,
     }
 
-    if is_llm_translation:
-        if do_sample:
-            if temperature is not None:
-                gen_kwargs["temperature"] = temperature
-            if top_k is not None:
-                gen_kwargs["top_k"] = top_k
-            if top_p is not None:
-                gen_kwargs["top_p"] = top_p
-    else:
-        gen_kwargs["temperature"] = temperature
-        gen_kwargs["top_k"] = top_k
-        gen_kwargs["top_p"] = top_p
+    if do_sample:
+        if temperature is not None:
+            gen_kwargs["temperature"] = temperature
+        if top_k is not None:
+            gen_kwargs["top_k"] = top_k
+        if top_p is not None:
+            gen_kwargs["top_p"] = top_p
 
     if repetition_penalty is not None:
         gen_kwargs["repetition_penalty"] = repetition_penalty
 
-    if is_llm_translation:
-        stop_token_ids = []
-        for token in ("<|im_end|>", "<|endoftext|>"):
-            token_id = tokenizer.convert_tokens_to_ids(token)
-            if token_id is not None and token_id != tokenizer.unk_token_id:
-                stop_token_ids.append(token_id)
-        if stop_token_ids:
-            gen_kwargs["eos_token_id"] = stop_token_ids
-        if tokenizer.pad_token_id is not None:
-            gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
-
-    if is_translation_model:
-        gen_kwargs["forced_bos_token_id"] = lang_code_to_idx
-
-    if model.config.model_type == "seamless_m4t":
-        gen_kwargs["tgt_lang"] = target_lang
+    stop_token_ids = []
+    for token in ("<|im_end|>", "<|endoftext|>"):
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None and token_id != tokenizer.unk_token_id:
+            stop_token_ids.append(token_id)
+    if stop_token_ids:
+        gen_kwargs["eos_token_id"] = stop_token_ids
+    if tokenizer.pad_token_id is not None:
+        gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
     if accelerator.is_main_process:
         print(
@@ -394,15 +236,14 @@ def main(
             f"Input file: {sentences_path}\n"
             f"Sentences dir: {sentences_dir}\n"
             f"Output file: {output_path}\n"
-            f"Source language: {source_lang}\n"
-            f"Target language: {target_lang}\n"
-            f"LLM translation mode: {is_llm_translation}\n"
+            f"Deprecated source_lang argument: {source_lang}\n"
+            f"Deprecated target_lang argument: {target_lang}\n"
+            f"LLM-only translation mode: True\n"
             f"LLM target language: {llm_target_language}\n"
             f"Context window: {context_window}\n"
             f"Merge small blocks: {merge_small_blocks}\n"
             f"LLM input max length: {llm_input_max_length}\n"
             f"LLM chunk chars: {llm_chunk_chars}\n"
-            f"Force target lang as BOS token: {is_translation_model}\n"
             f"Prompt: {prompt}\n"
             f"Starting batch size: {starting_batch_size}\n"
             f"Device: {str(accelerator.device).split(':')[0]}\n"
@@ -420,90 +261,6 @@ def main(
         print("** Generation parameters **")
         print("\n".join(f"{k}: {v}" for k, v in gen_kwargs.items()))
         print("\n")
-
-    @find_executable_batch_size(starting_batch_size=starting_batch_size)
-    def inference(batch_size, sentences_path, output_path):
-        nonlocal \
-            model, \
-            tokenizer, \
-            max_length, \
-            gen_kwargs, \
-            precision, \
-            prompt, \
-            is_translation_model
-
-        print(f"Translating {sentences_path} with batch size {batch_size}")
-
-        total_lines: int = count_lines(sentences_path)
-
-        data_loader = get_dataloader(
-            accelerator=accelerator,
-            filename=sentences_path,
-            tokenizer=tokenizer,
-            batch_size=batch_size,
-            max_length=max_length,
-            prompt=prompt,
-        )
-
-        model, data_loader = accelerator.prepare(model, data_loader)
-
-        samples_seen: int = 0
-
-        with tqdm(
-            total=total_lines,
-            desc="Dataset translation",
-            leave=True,
-            ascii=True,
-            disable=(not accelerator.is_main_process),
-        ) as pbar, open(output_path, "w", encoding="utf-8") as output_file:
-            with torch.no_grad():
-                for step, batch in enumerate(data_loader):
-                    batch["input_ids"] = batch["input_ids"]
-                    batch["attention_mask"] = batch["attention_mask"]
-
-                    generated_tokens = accelerator.unwrap_model(model).generate(
-                        **batch,
-                        **gen_kwargs,
-                    )
-
-                    generated_tokens = accelerator.pad_across_processes(
-                        generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
-                    )
-
-                    generated_tokens = (
-                        accelerator.gather(generated_tokens).cpu().numpy()
-                    )
-
-                    tgt_text = tokenizer.batch_decode(
-                        generated_tokens,
-                        skip_special_tokens=not keep_special_tokens,
-                        clean_up_tokenization_spaces=not keep_tokenization_spaces,
-                    )
-                    if accelerator.is_main_process:
-                        if (
-                            step
-                            == math.ceil(
-                                math.ceil(total_lines / batch_size)
-                                / accelerator.num_processes
-                            )
-                            - 1
-                        ):
-                            tgt_text = tgt_text[
-                                : (total_lines * num_return_sequences) - samples_seen
-                            ]
-                        else:
-                            samples_seen += len(tgt_text)
-
-                        print(
-                            "\n".join(
-                                [encode_string(sentence) for sentence in tgt_text]
-                            ),
-                            file=output_file,
-                        )
-
-                    pbar.update(len(tgt_text) // gen_kwargs["num_return_sequences"])
-
-        print(f"Translation done. Output written to {output_path}\n")
 
     @find_executable_batch_size(starting_batch_size=starting_batch_size)
     def llm_inference(batch_size, sentences_path, output_path):
@@ -690,16 +447,10 @@ def main(
             accelerator.wait_for_everyone()
 
         os.makedirs(os.path.abspath(os.path.dirname(final_output_path)), exist_ok=True)
-        if is_llm_translation:
-            llm_inference(
-                sentences_path=translation_input_path,
-                output_path=translation_output_path,
-            )
-        else:
-            inference(
-                sentences_path=translation_input_path,
-                output_path=translation_output_path,
-            )
+        llm_inference(
+            sentences_path=translation_input_path,
+            output_path=translation_output_path,
+        )
         accelerator.wait_for_everyone()
 
         if epub_work_paths is not None and is_epub_path(final_output_path):
@@ -709,10 +460,7 @@ def main(
                     translated_text_path=epub_work_paths["translated_text"],
                     manifest_path=epub_work_paths["manifest"],
                     output_epub_path=epub_work_paths["output_path"],
-                    target_language_code=get_epub_language_code(
-                        target_lang,
-                        llm_target_language,
-                    ),
+                    target_language_code=get_epub_language_code(llm_target_language),
                 )
                 shutil.rmtree(epub_work_paths["work_dir"], ignore_errors=True)
             accelerator.wait_for_everyone()
@@ -779,7 +527,7 @@ if __name__ == "__main__":
         type=str,
         default=None,
         required=False,
-        help="Source language id. See: supported_languages.md. Required for m2m100 and nllb200",
+        help="Deprecated and ignored in LLM-only mode. Use --llm_target_language instead.",
     )
 
     parser.add_argument(
@@ -787,7 +535,7 @@ if __name__ == "__main__":
         type=str,
         default=None,
         required=False,
-        help="Source language id. See: supported_languages.md. Required for m2m100 and nllb200",
+        help="Deprecated and ignored in LLM-only mode. Use --llm_target_language instead.",
     )
 
     parser.add_argument(
@@ -796,14 +544,14 @@ if __name__ == "__main__":
         default=None,
         help="Starting batch size, we will automatically reduce it if we find an OOM error."
         "If you use multiple devices, we will divide this number by the number of devices. "
-        "Defaults to 128 for traditional MT models and 1 for LLM translation mode.",
+        "Defaults to 1.",
     )
 
     parser.add_argument(
         "--model_name",
         type=str,
-        default="facebook/m2m100_1.2B",
-        help="Path to the model to use. See: https://huggingface.co/models",
+        default="Qwen/Qwen3-14B-Instruct",
+        help="Path or Hugging Face model name for an instruction-tuned CausalLM/chat model.",
     )
 
     parser.add_argument(
@@ -825,23 +573,21 @@ if __name__ == "__main__":
         "--max_length",
         type=int,
         default=None,
-        help="Maximum number of tokens in the source sentence and generated sentence. "
-        "Increase this value to translate longer sentences, at the cost of increasing memory usage. "
-        "Defaults to 256 for traditional MT models and 2048 for LLM translation mode.",
+        help="Maximum number of newly generated tokens per LLM call. Defaults to 2048.",
     )
 
     parser.add_argument(
         "--num_beams",
         type=int,
         default=None,
-        help="Number of beams for beam search. Defaults to 5 for traditional MT models and 1 for LLM translation mode.",
+        help="Number of beams for beam search. Defaults to 1.",
     )
 
     parser.add_argument(
         "--num_return_sequences",
         type=int,
         default=1,
-        help="Number of possible translation to return for each sentence (num_return_sequences<=num_beams).",
+        help="Number of translations to return for each input. LLM-only mode requires 1.",
     )
 
     parser.add_argument(
@@ -864,21 +610,21 @@ if __name__ == "__main__":
         "--temperature",
         type=float,
         default=None,
-        help="Temperature for sampling, value used only if do_sample is True. Defaults to 0.8 for traditional MT models.",
+        help="Temperature for sampling. Used only if --do_sample is set.",
     )
 
     parser.add_argument(
         "--top_k",
         type=int,
         default=None,
-        help="If do_sample is True, will sample from the top k most likely tokens. Defaults to 100 for traditional MT models.",
+        help="If --do_sample is set, sample from the top k most likely tokens.",
     )
 
     parser.add_argument(
         "--top_p",
         type=float,
         default=None,
-        help="If do_sample is True, will sample from nucleus probability mass top_p. Defaults to 0.75 for traditional MT models.",
+        help="If --do_sample is set, sample from nucleus probability mass top_p.",
     )
 
     parser.add_argument(
@@ -904,8 +650,7 @@ if __name__ == "__main__":
         "--prompt",
         type=str,
         default=None,
-        help="Prompt to use for generation. "
-        "It must include the special token %%SENTENCE%% which will be replaced by the sentence to translate.",
+        help="Deprecated legacy prompt option. Use --llm_prompt with a {TEXT} placeholder instead.",
     )
 
     parser.add_argument(
@@ -975,6 +720,8 @@ if __name__ == "__main__":
         target_lang=args.target_lang,
         starting_batch_size=args.starting_batch_size,
         model_name=args.model_name,
+        lora_weights_name_or_path=args.lora_weights_name_or_path,
+        force_auto_device_map=args.force_auto_device_map,
         max_length=args.max_length,
         num_beams=args.num_beams,
         num_return_sequences=args.num_return_sequences,

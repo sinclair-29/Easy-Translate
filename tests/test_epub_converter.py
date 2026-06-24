@@ -2,6 +2,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest import mock
 from zipfile import ZipFile
 
@@ -79,6 +80,22 @@ class XhtmlParsing(unittest.TestCase):
         self.assertIn('epub:type="titlepage"', serialized)
         self.assertIn("<h1>Hello</h1>", serialized)
         self.assertNotEqual(serialized.strip(), '<?xml version="1.0" encoding="utf-8"?>')
+        ET.fromstring(serialized.encode("utf-8"))
+
+    def test_broken_xml_html_prefix_is_removed_before_writing(self):
+        soup = epub_converter.BeautifulSoup(
+            "?xml version='1.0' encoding='utf-8'?html"
+            '<html epub:prefix="z3998: test"><body><p>Hello</p></body></html>',
+            "lxml",
+        )
+
+        serialized = epub_converter._serialized_xhtml(soup).decode("utf-8")
+
+        self.assertTrue(serialized.startswith("<?xml"))
+        self.assertNotIn("?xml version='1.0'", serialized)
+        self.assertNotIn("?html<html", serialized)
+        self.assertIn("<p>Hello</p>", serialized)
+        ET.fromstring(serialized.encode("utf-8"))
 
 
 @unittest.skipUnless(HAS_EPUB_DEPS, "EPUB dependencies are not installed")

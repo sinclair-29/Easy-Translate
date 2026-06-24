@@ -579,11 +579,8 @@ def _write_epub_preserving_package(
     final_output_path = os.path.abspath(output_epub_path)
     source_path = os.path.abspath(original_epub_path)
     for name, content in replacements.items():
-        if name.endswith((".xhtml", ".html")) and b"<html" not in content.lower():
-            raise ValueError(
-                "Refusing to write invalid EPUB XHTML replacement without "
-                f"an <html> root: {name}"
-            )
+        if name.endswith((".xhtml", ".html")):
+            _validate_xhtml_bytes(name, content)
     if final_output_path == source_path:
         temp_file = tempfile.NamedTemporaryFile(
             prefix=".easytranslate-",
@@ -644,34 +641,61 @@ def _set_xhtml_language(soup: BeautifulSoup, language_code: str) -> None:
                 break
 
 
+def _clean_xhtml_markup(markup: str) -> str:
+    markup = markup.lstrip("\ufeff\r\n\t ")
+    markup = re.sub(r"^\s*<!--\?xml[^>]*\?-->\s*", "", markup, count=1)
+    if markup.startswith("?xml"):
+        html_index = markup.find("<html")
+        if html_index != -1:
+            markup = markup[html_index:]
+    elif not markup.startswith("<") and "<html" in markup:
+        markup = markup[markup.find("<html") :]
+
+    if "epub:" in markup and "xmlns:epub" not in markup:
+        markup = re.sub(
+            r"(<html\b(?![^>]*\bxmlns:epub=)[^>]*)(>)",
+            r'\1 xmlns:epub="http://www.idpf.org/2007/ops"\2',
+            markup,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    if "<html" in markup and "xmlns=" not in markup.split(">", 1)[0]:
+        markup = re.sub(
+            r"(<html\b[^>]*)(>)",
+            r'\1 xmlns="http://www.w3.org/1999/xhtml"\2',
+            markup,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    if not markup.startswith("<?xml"):
+        markup = f'<?xml version="1.0" encoding="utf-8"?>\n{markup}'
+    return markup
+
+
+def _validate_xhtml_bytes(name: str, content: bytes) -> None:
+    stripped = content.lstrip()
+    if not stripped.startswith(b"<"):
+        raise ValueError(f"Invalid EPUB XHTML does not start with '<': {name}")
+    if b"<html" not in stripped.lower():
+        raise ValueError(f"Invalid EPUB XHTML missing <html> root: {name}")
+    try:
+        ET.fromstring(content)
+    except ET.ParseError as exc:
+        raise ValueError(f"Invalid EPUB XHTML XML in {name}: {exc}") from exc
+
+
 def _serialized_xhtml(soup: BeautifulSoup) -> bytes:
     html = soup.find("html")
     body = soup.find("body")
-    first_body_text = ""
     if body is not None:
-        for child in body.contents:
-            if isinstance(child, NavigableString) and str(child).strip():
-                first_body_text = str(child).strip().lower()
-                break
-
-    if html is not None and body is not None and "?xml" in first_body_text:
-        body_children = []
-        for child in body.contents:
+        for child in list(body.contents):
             if isinstance(child, NavigableString) and "?xml" in str(child).lower():
-                continue
-            body_children.append(str(child))
-        attrs = dict(html.attrs)
-        attrs.setdefault("xmlns", "http://www.w3.org/1999/xhtml")
-        body_markup = "".join(body_children)
-        if "epub:" in body_markup:
-            attrs["xmlns:epub"] = "http://www.idpf.org/2007/ops"
-        attr_text = " ".join(f'{key}="{value}"' for key, value in attrs.items())
-        return (
-            f'<?xml version="1.0" encoding="utf-8"?>\n'
-            f"<html {attr_text}><body>{body_markup}</body></html>"
-        ).encode("utf-8")
+                child.extract()
 
-    return str(soup).encode("utf-8")
+    markup = str(html if html is not None else soup)
+    content = _clean_xhtml_markup(markup).encode("utf-8")
+    _validate_xhtml_bytes("<generated>", content)
+    return content
 
 
 def _append_chinese_css_overrides(content: bytes) -> bytes:
