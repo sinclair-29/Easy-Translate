@@ -578,6 +578,12 @@ def _write_epub_preserving_package(
 
     final_output_path = os.path.abspath(output_epub_path)
     source_path = os.path.abspath(original_epub_path)
+    for name, content in replacements.items():
+        if name.endswith((".xhtml", ".html")) and b"<html" not in content.lower():
+            raise ValueError(
+                "Refusing to write invalid EPUB XHTML replacement without "
+                f"an <html> root: {name}"
+            )
     if final_output_path == source_path:
         temp_file = tempfile.NamedTemporaryFile(
             prefix=".easytranslate-",
@@ -720,7 +726,10 @@ def _apply_metadata_replacements(
             language_tag.clear()
             language_tag.append(language_code)
         _set_xhtml_language(soup, language_code)
-        replacements[zip_name] = _serialized_xhtml(soup)
+        if zip_name.endswith((".xhtml", ".html")):
+            replacements[zip_name] = _serialized_xhtml(soup)
+        else:
+            replacements[zip_name] = str(soup).encode("utf-8")
 
 
 def _apply_language_and_css_replacements(
@@ -730,6 +739,8 @@ def _apply_language_and_css_replacements(
 ) -> None:
     for zip_name in epub_zip.namelist():
         if zip_name.endswith((".xhtml", ".html")):
+            if zip_name in replacements:
+                continue
             soup = _parse_html(replacements.get(zip_name, epub_zip.read(zip_name)))
             _set_xhtml_language(soup, language_code)
             replacements[zip_name] = _serialized_xhtml(soup)
@@ -856,6 +867,7 @@ def text_to_epub(
                     block.clear()
                     block.append(translated_text)
 
+            _set_xhtml_language(soup, target_language_code)
             replacements[zip_name] = _serialized_xhtml(soup)
 
         _apply_metadata_replacements(
