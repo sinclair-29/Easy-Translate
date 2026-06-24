@@ -110,6 +110,15 @@ def _parse_html(content):
         return BeautifulSoup(content, "lxml")
     import warnings
 
+    if isinstance(content, bytes):
+        probe = content[:512].lower()
+    else:
+        probe = str(content[:512]).lower()
+    if b"<?xml" in probe if isinstance(probe, bytes) else "<?xml" in probe:
+        return BeautifulSoup(content, "xml")
+    if b"xmlns=" in probe if isinstance(probe, bytes) else "xmlns=" in probe:
+        return BeautifulSoup(content, "xml")
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
         return BeautifulSoup(content, "lxml")
@@ -596,6 +605,10 @@ def _set_xhtml_language(soup: BeautifulSoup, language_code: str) -> None:
     if html is not None:
         html["lang"] = language_code
         html["xml:lang"] = language_code
+        for tag in soup.find_all(True):
+            if any(str(attr).startswith("epub:") for attr in tag.attrs):
+                html["xmlns:epub"] = "http://www.idpf.org/2007/ops"
+                break
 
 
 def _append_chinese_css_overrides(content: bytes) -> bytes:
