@@ -23,6 +23,14 @@ from llm_translation import (
     split_text_for_llm,
 )
 from model import load_model_for_inference
+from terminology import (
+    build_terminology_prompt,
+    collect_term_candidates,
+    format_terminology_section,
+    parse_terminology_memory,
+    save_terminology_memory,
+    select_relevant_terms,
+)
 
 
 def encode_string(text):
@@ -51,9 +59,14 @@ def get_epub_work_paths(input_path: str, output_path: str):
         "source_text": os.path.join(work_dir, "source.txt"),
         "translated_text": os.path.join(work_dir, "translated.txt"),
         "manifest": os.path.join(work_dir, "manifest.json"),
+        "terms": os.path.join(work_dir, "terms.json"),
         "input_epub": input_path,
         "output_path": output_path,
     }
+
+
+def get_terms_path(output_path: str) -> str:
+    return os.path.abspath(output_path) + ".easytranslate_terms.json"
 
 
 def get_epub_language_code(llm_target_language: str) -> str:
@@ -127,6 +140,48 @@ def load_epub_unit_metadata(manifest_path: Optional[str], total_lines: int):
     return unit_metadata
 
 
+def generate_terminology_memory(
+    source_lines: List[str],
+    unit_metadata: Optional[List[dict]],
+    target_language: str,
+    terms_path: str,
+    generate_prompts,
+):
+    candidates = collect_term_candidates(source_lines, unit_metadata)
+    if len(candidates) < 3:
+        return None
+
+    prompt = build_terminology_prompt(candidates, target_language=target_language)
+    first_response = generate_prompts([prompt])[0]
+    try:
+        memory = parse_terminology_memory(first_response)
+    except (ValueError, json.JSONDecodeError) as first_error:
+        retry_prompt = build_terminology_prompt(
+            candidates,
+            target_language=target_language,
+            strict=True,
+            previous_response=first_response,
+        )
+        retry_response = generate_prompts([retry_prompt])[0]
+        try:
+            memory = parse_terminology_memory(retry_response)
+        except (ValueError, json.JSONDecodeError) as retry_error:
+            print(
+                "WARNING: Automatic terminology generation failed after one retry. "
+                f"Continuing without terminology memory. First error: {first_error}. "
+                f"Retry error: {retry_error}"
+            )
+            return None
+
+    if not memory.get("terms") and not memory.get("proper_names"):
+        print("WARNING: Automatic terminology generation returned no usable entries.")
+        return None
+
+    save_terminology_memory(memory, terms_path)
+    print(f"Automatic terminology memory written to {terms_path}")
+    return memory
+
+
 def main(
     sentences_path: Optional[str],
     sentences_dir: Optional[str],
@@ -158,6 +213,7 @@ def main(
     merge_max_chars: int = 1200,
     llm_input_max_length: int = 8192,
     llm_chunk_chars: int = 3000,
+    disable_auto_terms: bool = False,
 ):
     accelerator = Accelerator()
 
@@ -304,6 +360,7 @@ def main(
             f"Deprecated target_lang argument: {target_lang}\n"
             f"LLM-only translation mode: True\n"
             f"LLM target language: {llm_target_language}\n"
+            f"Automatic terminology memory: {not disable_auto_terms}\n"
             f"Context window: {context_window}\n"
             f"Merge small blocks: {merge_small_blocks}\n"
             f"LLM input max length: {llm_input_max_length}\n"
@@ -327,7 +384,13 @@ def main(
         print("\n")
 
     @find_executable_batch_size(starting_batch_size=starting_batch_size)
-    def llm_inference(batch_size, sentences_path, output_path, manifest_path=None):
+    def llm_inference(
+        batch_size,
+        sentences_path,
+        output_path,
+        manifest_path=None,
+        terms_path=None,
+    ):
         nonlocal model, tokenizer, max_length, gen_kwargs
 
         if not accelerator.is_main_process:
@@ -337,12 +400,6 @@ def main(
         print(f"Translating {sentences_path} with LLM batch size {batch_size}")
         source_lines = read_text_lines(sentences_path)
         unit_metadata = load_epub_unit_metadata(manifest_path, len(source_lines))
-        groups = make_translation_groups(
-            source_lines,
-            merge_small_blocks=merge_small_blocks,
-            merge_max_chars=merge_max_chars,
-            unit_metadata=unit_metadata,
-        )
         translations = [None] * len(source_lines)
         prepared_model = accelerator.prepare(model)
 
@@ -392,6 +449,32 @@ def main(
                 clean_up_tokenization_spaces=not keep_tokenization_spaces,
             )
 
+        terminology_memory = None
+        if not disable_auto_terms and source_lines:
+            terminology_memory = generate_terminology_memory(
+                source_lines=source_lines,
+                unit_metadata=unit_metadata,
+                target_language=llm_target_language,
+                terms_path=terms_path or get_terms_path(output_path),
+                generate_prompts=generate_prompts,
+            )
+
+        groups = make_translation_groups(
+            source_lines,
+            merge_small_blocks=merge_small_blocks,
+            merge_max_chars=merge_max_chars,
+            unit_metadata=unit_metadata,
+        )
+
+        def terminology_section_for(text, context):
+            if not terminology_memory:
+                return ""
+            relevant_entries = select_relevant_terms(
+                terminology_memory,
+                f"{text}\n{context}",
+            )
+            return format_terminology_section(relevant_entries)
+
         def build_prompt_for_group(group):
             context = build_context(
                 source_lines,
@@ -400,25 +483,30 @@ def main(
                 window=context_window,
             )
             text = build_numbered_text(source_lines[index] for index in group)
+            terminology_section = terminology_section_for(text, context)
             return build_llm_prompt(
                 text=text,
                 target_language=llm_target_language,
                 context=context,
                 prompt_template=llm_prompt,
+                terminology_section=terminology_section,
             )
 
         def translate_single_line(index):
             chunks = split_text_for_llm(source_lines[index], llm_chunk_chars)
+            context = build_context(
+                source_lines,
+                start_index=index,
+                end_index=index,
+                window=context_window,
+            )
+            text = build_numbered_text(chunks)
             prompt_text = build_llm_prompt(
-                text=build_numbered_text(chunks),
+                text=text,
                 target_language=llm_target_language,
-                context=build_context(
-                    source_lines,
-                    start_index=index,
-                    end_index=index,
-                    window=context_window,
-                ),
+                context=context,
                 prompt_template=llm_prompt,
+                terminology_section=terminology_section_for(text, context),
             )
             decoded_output = generate_prompts([prompt_text])[0]
             try:
@@ -436,6 +524,7 @@ def main(
                             target_language=llm_target_language,
                             context="",
                             prompt_template=llm_prompt,
+                            terminology_section=terminology_section_for(chunk, ""),
                         )
                         for chunk in chunks
                     ]
@@ -494,11 +583,13 @@ def main(
         translation_manifest_path = None
         translation_input_path = input_path
         translation_output_path = final_output_path
+        terms_path = get_terms_path(final_output_path)
 
         if is_epub_path(input_path):
             epub_work_paths = get_epub_work_paths(input_path, final_output_path)
             translation_input_path = epub_work_paths["source_text"]
             translation_manifest_path = epub_work_paths["manifest"]
+            terms_path = epub_work_paths["terms"]
             if is_epub_path(final_output_path):
                 translation_output_path = epub_work_paths["translated_text"]
 
@@ -519,6 +610,7 @@ def main(
             sentences_path=translation_input_path,
             output_path=translation_output_path,
             manifest_path=translation_manifest_path,
+            terms_path=terms_path,
         )
         accelerator.wait_for_everyone()
 
@@ -531,11 +623,6 @@ def main(
                     output_epub_path=epub_work_paths["output_path"],
                     target_language_code=get_epub_language_code(llm_target_language),
                 )
-                shutil.rmtree(epub_work_paths["work_dir"], ignore_errors=True)
-            accelerator.wait_for_everyone()
-        elif epub_work_paths is not None:
-            if accelerator.is_main_process:
-                shutil.rmtree(epub_work_paths["work_dir"], ignore_errors=True)
             accelerator.wait_for_everyone()
 
     if sentences_path is not None:
@@ -740,7 +827,8 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Prompt template for LLM translation mode. Must include {TEXT}. "
-        "May also include {CONTEXT}, {CONTEXT_SECTION}, and {TARGET_LANGUAGE}.",
+        "May also include {CONTEXT}, {CONTEXT_SECTION}, {TERMINOLOGY_SECTION}, "
+        "and {TARGET_LANGUAGE}.",
     )
 
     parser.add_argument(
@@ -778,6 +866,12 @@ if __name__ == "__main__":
         help="Split oversized source blocks into chunks of about this many characters before LLM translation.",
     )
 
+    parser.add_argument(
+        "--disable_auto_terms",
+        action="store_true",
+        help="Disable automatic terminology memory generation and prompt injection.",
+    )
+
     args = parser.parse_args()
 
     main(
@@ -811,4 +905,5 @@ if __name__ == "__main__":
         merge_max_chars=args.merge_max_chars,
         llm_input_max_length=args.llm_input_max_length,
         llm_chunk_chars=args.llm_chunk_chars,
+        disable_auto_terms=args.disable_auto_terms,
     )

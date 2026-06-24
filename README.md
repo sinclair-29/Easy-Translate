@@ -16,6 +16,7 @@ supported in this version.
 - Deterministic LLM generation by default.
 - Optional neighboring-block context with `--context_window`.
 - Optional short-block grouping with `--merge_small_blocks`.
+- Automatic terminology memory for recurring names and terms.
 - Long block splitting with `--llm_chunk_chars`.
 - BF16 / FP16 / FP32 / 8-bit / 4-bit model loading.
 - LoRA model loading.
@@ -112,7 +113,8 @@ python3 translate.py \
 ```
 
 Use `--llm_prompt` to provide a custom prompt template. It must include `{TEXT}`;
-it may also include `{CONTEXT}`, `{CONTEXT_SECTION}`, and `{TARGET_LANGUAGE}`.
+it may also include `{CONTEXT}`, `{CONTEXT_SECTION}`, `{TERMINOLOGY_SECTION}`,
+and `{TARGET_LANGUAGE}`.
 
 ```bash
 python3 translate.py \
@@ -124,6 +126,18 @@ python3 translate.py \
 
 The old `--prompt` / `%%SENTENCE%%` prompting path has been removed. Use
 `--llm_prompt` instead.
+
+## Automatic Terminology Memory
+
+By default, Easy-Translate scans the extracted source blocks before translation,
+asks the loaded LLM to prepare a compact JSON terminology memory, and injects
+only relevant entries into each translation prompt.
+
+For EPUB input, the memory is saved as `terms.json` in the
+`.easytranslate_epub` work directory. For TXT input, it is saved next to the
+output as `<output_path>.easytranslate_terms.json`.
+
+Disable this step with `--disable_auto_terms`.
 
 ## Useful Runtime Options
 
@@ -140,6 +154,8 @@ The old `--prompt` / `%%SENTENCE%%` prompting path has been removed. Use
 - `--llm_input_max_length`: maximum tokenized prompt length.
 - `--llm_chunk_chars`: approximate source characters per chunk for oversized
   source blocks.
+- `--disable_auto_terms`: skip automatic terminology memory generation and
+  prompt injection.
 - `--do_sample`, `--temperature`, `--top_k`, `--top_p`: optional sampling
   controls. Sampling parameters are only sent to the model when `--do_sample` is
   enabled.
