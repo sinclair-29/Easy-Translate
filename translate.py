@@ -11,16 +11,16 @@ from tqdm import tqdm
 
 from epub_converter import epub_to_text, require_epub_dependencies, text_to_epub
 from llm_translation import (
-    apply_chat_template_tokenized,
     build_context,
     build_llm_prompt,
     build_numbered_text,
-    build_plain_prompt,
+    estimate_llm_prompt_tokens,
     is_llm_translation_model,
     make_translation_groups,
     parse_numbered_translations,
     read_text_lines,
-    split_text_for_llm,
+    split_text_for_token_budget,
+    tokenize_llm_prompt,
 )
 from model import load_model_for_inference
 from terminology import (
@@ -403,40 +403,28 @@ def main(
         translations = [None] * len(source_lines)
         prepared_model = accelerator.prepare(model)
 
-        def build_llm_batch(prompt_texts):
-            tokenized_prompts = [
-                apply_chat_template_tokenized(tokenizer, prompt_text)
-                for prompt_text in prompt_texts
+        def build_llm_batch(prompt_texts, enforce_input_budget=True):
+            encoded_prompts = [
+                tokenize_llm_prompt(tokenizer, prompt_text) for prompt_text in prompt_texts
             ]
-            if all(prompt is not None for prompt in tokenized_prompts):
-                encoded_prompts = []
-                for prompt in tokenized_prompts:
-                    if hasattr(prompt, "keys") and "input_ids" in prompt:
-                        prompt = prompt["input_ids"]
-                    if hasattr(prompt, "squeeze"):
-                        prompt = prompt.squeeze(0)
-                    if hasattr(prompt, "tolist"):
-                        prompt = prompt.tolist()
-                    encoded_prompts.append(prompt)
-                return tokenizer.pad(
-                    {"input_ids": encoded_prompts},
-                    padding=True,
-                    return_tensors="pt",
+            longest_prompt = max((len(prompt) for prompt in encoded_prompts), default=0)
+            if enforce_input_budget and longest_prompt > llm_input_max_length:
+                raise ValueError(
+                    f"LLM prompt has {longest_prompt} input tokens, which exceeds "
+                    f"--llm_input_max_length {llm_input_max_length}. Increase "
+                    "--llm_input_max_length, reduce --context_window, or disable auto terms."
                 )
-
-            rendered_prompts = [
-                build_plain_prompt(tokenizer, prompt_text) for prompt_text in prompt_texts
-            ]
-            return tokenizer(
-                rendered_prompts,
+            return tokenizer.pad(
+                {"input_ids": encoded_prompts},
                 padding=True,
-                truncation=True,
-                max_length=llm_input_max_length,
                 return_tensors="pt",
             )
 
-        def generate_prompts(prompt_texts):
-            batch = build_llm_batch(prompt_texts)
+        def generate_prompts(prompt_texts, enforce_input_budget=True):
+            batch = build_llm_batch(
+                prompt_texts,
+                enforce_input_budget=enforce_input_budget,
+            )
             batch = {key: value.to(accelerator.device) for key, value in batch.items()}
             generated_tokens = accelerator.unwrap_model(prepared_model).generate(
                 **batch,
@@ -456,15 +444,11 @@ def main(
                 unit_metadata=unit_metadata,
                 target_language=llm_target_language,
                 terms_path=terms_path or get_terms_path(output_path),
-                generate_prompts=generate_prompts,
+                generate_prompts=lambda prompts: generate_prompts(
+                    prompts,
+                    enforce_input_budget=False,
+                ),
             )
-
-        groups = make_translation_groups(
-            source_lines,
-            merge_small_blocks=merge_small_blocks,
-            merge_max_chars=merge_max_chars,
-            unit_metadata=unit_metadata,
-        )
 
         def terminology_section_for(text, context):
             if not terminology_memory:
@@ -492,45 +476,137 @@ def main(
                 terminology_section=terminology_section,
             )
 
+        def prompt_token_count(prompt_text):
+            return estimate_llm_prompt_tokens(tokenizer, prompt_text)
+
+        def prompt_fits_budget(prompt_text):
+            return prompt_token_count(prompt_text) <= llm_input_max_length
+
+        def group_fits_budget(group):
+            return prompt_fits_budget(build_prompt_for_group(group))
+
+        groups = make_translation_groups(
+            source_lines,
+            merge_small_blocks=merge_small_blocks,
+            merge_max_chars=merge_max_chars,
+            unit_metadata=unit_metadata,
+            fits_budget=group_fits_budget,
+        )
+
+        def build_group_record(group):
+            prompt_text = build_prompt_for_group(group)
+            token_count = prompt_token_count(prompt_text)
+            if token_count > llm_input_max_length and len(group) > 1:
+                raise ValueError(
+                    f"Merged LLM prompt for lines {group[0] + 1}-{group[-1] + 1} "
+                    f"has {token_count} input tokens, which exceeds "
+                    f"--llm_input_max_length {llm_input_max_length}."
+                )
+            return {
+                "group": group,
+                "prompt": prompt_text if token_count <= llm_input_max_length else None,
+                "token_count": token_count,
+            }
+
+        group_records = [build_group_record(group) for group in groups]
+        group_records = sorted(
+            enumerate(group_records),
+            key=lambda item: (item[1]["token_count"], item[0]),
+        )
+        group_records = [record for _, record in group_records]
+
         def translate_single_line(index):
-            chunks = split_text_for_llm(source_lines[index], llm_chunk_chars)
             context = build_context(
                 source_lines,
                 start_index=index,
                 end_index=index,
                 window=context_window,
             )
-            text = build_numbered_text(chunks)
-            prompt_text = build_llm_prompt(
-                text=text,
+            full_text = build_numbered_text([source_lines[index]])
+            full_prompt = build_llm_prompt(
+                text=full_text,
                 target_language=llm_target_language,
                 context=context,
                 prompt_template=llm_prompt,
-                terminology_section=terminology_section_for(text, context),
+                terminology_section=terminology_section_for(full_text, context),
             )
-            decoded_output = generate_prompts([prompt_text])[0]
-            try:
-                translated_chunks = parse_numbered_translations(
-                    decoded_output,
-                    expected_count=len(chunks),
+            if prompt_fits_budget(full_prompt):
+                decoded_output = generate_prompts([full_prompt])[0]
+                try:
+                    return parse_numbered_translations(
+                        decoded_output,
+                        expected_count=1,
+                    )[0].strip()
+                except ValueError:
+                    return decoded_output.strip()
+
+            def chunk_fits_budget(chunk):
+                chunk_text = build_numbered_text([chunk])
+                chunk_prompt = build_llm_prompt(
+                    text=chunk_text,
+                    target_language=llm_target_language,
+                    context=context,
+                    prompt_template=llm_prompt,
+                    terminology_section=terminology_section_for(chunk_text, context),
                 )
-            except ValueError:
-                if len(chunks) == 1:
-                    translated_chunks = [decoded_output.strip()]
-                else:
-                    fallback_prompts = [
-                        build_llm_prompt(
-                            text=chunk,
+                return prompt_fits_budget(chunk_prompt)
+
+            try:
+                chunks = split_text_for_token_budget(
+                    source_lines[index],
+                    fits_text=chunk_fits_budget,
+                    max_chars=llm_chunk_chars,
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"Source line {index + 1} cannot fit in the LLM input token "
+                    f"budget even after splitting: {error} Increase "
+                    "--llm_input_max_length, reduce --context_window, or disable auto terms."
+                ) from error
+
+            def build_chunk_group_prompt(chunk_group):
+                text = build_numbered_text(
+                    chunks[chunk_index] for chunk_index in chunk_group
+                )
+                return build_llm_prompt(
+                    text=text,
+                    target_language=llm_target_language,
+                    context=context,
+                    prompt_template=llm_prompt,
+                    terminology_section=terminology_section_for(text, context),
+                )
+
+            chunk_groups = make_translation_groups(
+                chunks,
+                merge_small_blocks=True,
+                merge_max_chars=llm_chunk_chars,
+                fits_budget=lambda group: prompt_fits_budget(
+                    build_chunk_group_prompt(group)
+                ),
+            )
+            translated_chunks = []
+            for chunk_group in chunk_groups:
+                prompt_text = build_chunk_group_prompt(chunk_group)
+                decoded_output = generate_prompts([prompt_text])[0]
+                try:
+                    parsed_chunks = parse_numbered_translations(
+                        decoded_output,
+                        expected_count=len(chunk_group),
+                    )
+                except ValueError:
+                    parsed_chunks = []
+                    for chunk_index in chunk_group:
+                        chunk = chunks[chunk_index]
+                        chunk_text = build_numbered_text([chunk])
+                        chunk_prompt = build_llm_prompt(
+                            text=chunk_text,
                             target_language=llm_target_language,
                             context="",
                             prompt_template=llm_prompt,
-                            terminology_section=terminology_section_for(chunk, ""),
+                            terminology_section=terminology_section_for(chunk_text, ""),
                         )
-                        for chunk in chunks
-                    ]
-                    translated_chunks = [
-                        output.strip() for output in generate_prompts(fallback_prompts)
-                    ]
+                        parsed_chunks.append(generate_prompts([chunk_prompt])[0].strip())
+                translated_chunks.extend(parsed_chunks)
             return " ".join(chunk.strip() for chunk in translated_chunks if chunk.strip())
 
         with tqdm(
@@ -540,12 +616,31 @@ def main(
             ascii=True,
         ) as pbar, open(output_path, "w", encoding="utf-8") as output_file:
             with torch.no_grad():
-                for group_start in range(0, len(groups), batch_size):
-                    batch_groups = groups[group_start : group_start + batch_size]
-                    prompt_texts = [build_prompt_for_group(group) for group in batch_groups]
-                    decoded_outputs = generate_prompts(prompt_texts)
+                for group_start in range(0, len(group_records), batch_size):
+                    batch_records = group_records[group_start : group_start + batch_size]
+                    ready_records = [
+                        record for record in batch_records if record["prompt"] is not None
+                    ]
+                    if ready_records:
+                        decoded_outputs = generate_prompts(
+                            [record["prompt"] for record in ready_records]
+                        )
+                    else:
+                        decoded_outputs = []
 
-                    for group, decoded_output in zip(batch_groups, decoded_outputs):
+                    decoded_by_group = {
+                        tuple(record["group"]): decoded_output
+                        for record, decoded_output in zip(ready_records, decoded_outputs)
+                    }
+
+                    for record in batch_records:
+                        group = record["group"]
+                        decoded_output = decoded_by_group.get(tuple(group))
+                        if decoded_output is None:
+                            translations[group[0]] = translate_single_line(group[0])
+                            pbar.update(1)
+                            continue
+
                         if len(group) == 1:
                             try:
                                 parsed_outputs = parse_numbered_translations(
@@ -848,7 +943,8 @@ if __name__ == "__main__":
         "--merge_max_chars",
         type=int,
         default=1200,
-        help="Maximum total characters per merged short-block group in LLM translation mode.",
+        help="Legacy character fallback for merged short-block groups. "
+        "--llm_input_max_length is the main LLM prompt budget.",
     )
 
     parser.add_argument(
@@ -863,7 +959,8 @@ if __name__ == "__main__":
         "--llm_chunk_chars",
         type=int,
         default=3000,
-        help="Split oversized source blocks into chunks of about this many characters before LLM translation.",
+        help="Approximate character fallback used while splitting oversized source blocks. "
+        "--llm_input_max_length is the main LLM prompt budget.",
     )
 
     parser.add_argument(

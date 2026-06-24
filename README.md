@@ -150,10 +150,11 @@ Disable this step with `--disable_auto_terms`.
 - `--context_window`: neighboring source blocks passed as context.
 - `--merge_small_blocks`: groups neighboring short blocks into numbered LLM
   calls while preserving output line count.
-- `--merge_max_chars`: maximum source characters in each merged group.
+- `--merge_max_chars`: legacy character fallback for merged groups; the rendered
+  prompt token budget is controlled by `--llm_input_max_length`.
 - `--llm_input_max_length`: maximum tokenized prompt length.
 - `--llm_chunk_chars`: approximate source characters per chunk for oversized
-  source blocks.
+  source blocks after token-budget checks.
 - `--disable_auto_terms`: skip automatic terminology memory generation and
   prompt injection.
 - `--do_sample`, `--temperature`, `--top_k`, `--top_p`: optional sampling

@@ -1,5 +1,5 @@
 import re
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 
 DEFAULT_LLM_SYSTEM_PROMPT = "You are a professional translator."
@@ -140,6 +140,64 @@ def split_text_for_llm(text: str, max_chars: int) -> List[str]:
     return chunks or [text]
 
 
+def split_text_for_token_budget(
+    text: str,
+    fits_text,
+    max_chars: int,
+) -> List[str]:
+    if fits_text(text):
+        return [text]
+
+    initial_chunks = split_text_for_llm(text, max_chars)
+    split_chunks = []
+    for chunk in initial_chunks:
+        split_chunks.extend(_split_chunk_for_token_budget(chunk, fits_text))
+    return split_chunks
+
+
+def _split_chunk_for_token_budget(text: str, fits_text) -> List[str]:
+    text = text.strip()
+    if not text:
+        return [text]
+    if fits_text(text):
+        return [text]
+    if len(text) <= 1:
+        raise ValueError("Prompt overhead exceeds the LLM input token budget.")
+
+    split_at = _find_split_point(text)
+    if split_at <= 0 or split_at >= len(text):
+        split_at = len(text) // 2
+
+    left = text[:split_at].strip()
+    right = text[split_at:].strip()
+    if not left or not right:
+        raise ValueError("Prompt overhead exceeds the LLM input token budget.")
+
+    return _split_chunk_for_token_budget(left, fits_text) + _split_chunk_for_token_budget(
+        right,
+        fits_text,
+    )
+
+
+def _find_split_point(text: str) -> int:
+    midpoint = len(text) // 2
+    best_position = -1
+    best_distance = len(text)
+    for separator in ("\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " "):
+        search_start = 0
+        while True:
+            position = text.find(separator, search_start)
+            if position == -1:
+                break
+            candidate = position + len(separator)
+            distance = abs(candidate - midpoint)
+            if distance < best_distance:
+                best_position = candidate
+                best_distance = distance
+            search_start = position + len(separator)
+    return best_position
+
+
 def build_llm_prompt(
     text: str,
     target_language: str,
@@ -218,6 +276,38 @@ def apply_chat_template_tokenized(tokenizer, prompt_text: str):
         )
 
 
+def _input_ids_to_list(tokenized) -> List[int]:
+    if hasattr(tokenized, "keys") and "input_ids" in tokenized:
+        tokenized = tokenized["input_ids"]
+    if hasattr(tokenized, "squeeze"):
+        tokenized = tokenized.squeeze(0)
+    if hasattr(tokenized, "tolist"):
+        tokenized = tokenized.tolist()
+    if isinstance(tokenized, int):
+        return [tokenized]
+    if tokenized and isinstance(tokenized[0], list):
+        tokenized = tokenized[0]
+    return list(tokenized)
+
+
+def tokenize_llm_prompt(tokenizer, prompt_text: str) -> List[int]:
+    tokenized_prompt = apply_chat_template_tokenized(tokenizer, prompt_text)
+    if tokenized_prompt is not None:
+        return _input_ids_to_list(tokenized_prompt)
+
+    rendered_prompt = build_plain_prompt(tokenizer, prompt_text)
+    tokenized_prompt = tokenizer(
+        rendered_prompt,
+        truncation=False,
+        add_special_tokens=True,
+    )
+    return _input_ids_to_list(tokenized_prompt)
+
+
+def estimate_llm_prompt_tokens(tokenizer, prompt_text: str) -> int:
+    return len(tokenize_llm_prompt(tokenizer, prompt_text))
+
+
 def build_plain_prompt(tokenizer, prompt_text: str) -> str:
     return render_chat_prompt(tokenizer, prompt_text)
 
@@ -227,6 +317,7 @@ def make_translation_groups(
     merge_small_blocks: bool,
     merge_max_chars: int,
     unit_metadata: Optional[List[dict]] = None,
+    fits_budget: Optional[Callable[[List[int]], bool]] = None,
 ):
     if not merge_small_blocks:
         return [[index] for index in range(len(lines))]
@@ -237,15 +328,25 @@ def make_translation_groups(
 
     for index, line in enumerate(lines):
         line_chars = len(line)
-        can_merge = line_chars <= merge_max_chars
-        would_fit = current_chars + line_chars <= merge_max_chars
+        candidate_group = current_group + [index]
+        metadata_compatible = bool(current_group) and _can_merge_units(
+            current_group[-1],
+            index,
+            unit_metadata,
+        )
+        if fits_budget is None:
+            can_merge = line_chars <= merge_max_chars
+            would_fit = current_chars + line_chars <= merge_max_chars
+            should_merge = (
+                can_merge
+                and bool(current_group)
+                and would_fit
+                and metadata_compatible
+            )
+        else:
+            should_merge = metadata_compatible and fits_budget(candidate_group)
 
-        if (
-            can_merge
-            and current_group
-            and would_fit
-            and _can_merge_units(current_group[-1], index, unit_metadata)
-        ):
+        if should_merge:
             current_group.append(index)
             current_chars += line_chars
             continue
