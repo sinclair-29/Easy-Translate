@@ -53,6 +53,21 @@ coverage.xml
 # Translations
 *.mo
 *.pot
+translated_epubs/
+batch_logs/
+books/input/*
+books/output/*
+books/work/*
+books/logs/*
+!books/input/.gitkeep
+!books/output/.gitkeep
+!books/work/.gitkeep
+!books/logs/.gitkeep
+!books/README.md
+*.easytranslate_epub/
+*.easytranslate_partial.jsonl
+*.easytranslate_partial.meta.json
+*.easytranslate_terms.json
 
 # Django stuff:
 *.log

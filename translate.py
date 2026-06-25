@@ -56,8 +56,15 @@ def directory_may_include_epubs(directory: Optional[str], files_extension: str) 
     return any(is_epub_path(path) for path in glob.glob(os.path.join(directory, "*")))
 
 
-def get_epub_work_paths(input_path: str, output_path: str):
-    work_dir = os.path.abspath(output_path) + ".easytranslate_epub"
+def get_epub_work_paths(input_path: str, output_path: str, work_dir_root: Optional[str] = None):
+    if work_dir_root:
+        output_name = os.path.basename(os.path.abspath(output_path))
+        work_dir = os.path.join(
+            os.path.abspath(work_dir_root),
+            output_name + ".easytranslate_epub",
+        )
+    else:
+        work_dir = os.path.abspath(output_path) + ".easytranslate_epub"
     return {
         "work_dir": work_dir,
         "source_text": os.path.join(work_dir, "source.txt"),
@@ -338,6 +345,7 @@ def main(
     llm_chunk_chars: int = 3000,
     disable_auto_terms: bool = False,
     disable_resume: bool = False,
+    work_dir: Optional[str] = None,
 ):
     accelerator = Accelerator()
 
@@ -508,6 +516,7 @@ def main(
             f"Input file: {sentences_path}\n"
             f"Sentences dir: {sentences_dir}\n"
             f"Output file: {output_path}\n"
+            f"EPUB work dir: {work_dir}\n"
             f"Deprecated source_lang argument: {source_lang}\n"
             f"Deprecated target_lang argument: {target_lang}\n"
             f"LLM-only translation mode: True\n"
@@ -1096,7 +1105,7 @@ def main(
         partial_paths = get_partial_paths(final_output_path)
 
         if is_epub_path(input_path):
-            epub_work_paths = get_epub_work_paths(input_path, final_output_path)
+            epub_work_paths = get_epub_work_paths(input_path, final_output_path, work_dir)
             translation_input_path = epub_work_paths["source_text"]
             translation_manifest_path = epub_work_paths["manifest"]
             terms_path = epub_work_paths["terms"]
@@ -1196,6 +1205,13 @@ if __name__ == "__main__":
         required=True,
         help="Path to a txt file where the translated sentences will be written. If the input is a directory, "
         "the output will be a directory with the same structure.",
+    )
+
+    parser.add_argument(
+        "--work_dir",
+        type=str,
+        default=None,
+        help="Optional root directory for EPUB extraction, manifest, resume cache, and temporary translated text.",
     )
 
     parser.add_argument(
@@ -1460,4 +1476,5 @@ if __name__ == "__main__":
         llm_chunk_chars=args.llm_chunk_chars,
         disable_auto_terms=args.disable_auto_terms,
         disable_resume=args.disable_resume,
+        work_dir=args.work_dir,
     )

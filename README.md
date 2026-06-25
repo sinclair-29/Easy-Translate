@@ -72,6 +72,20 @@ python3 translate.py \
 If the EPUB output path ends in `.txt`, Easy-Translate writes one translated
 line per extracted EPUB block instead of rebuilding an EPUB.
 
+For cleaner local runs, put source EPUBs in `books/input` and use `--work_dir`
+to keep extraction, manifest, and resume files away from final EPUB outputs:
+
+```bash
+python3 translate.py \
+  --sentences_path books/input/book.epub \
+  --output_path books/output/book_zh.epub \
+  --work_dir books/work \
+  --model_name google/translategemma-12b-it \
+  --precision bf16 \
+  --source_lang_code en \
+  --target_lang_code zh-CN
+```
+
 ## Translate A TXT File
 
 ```bash
