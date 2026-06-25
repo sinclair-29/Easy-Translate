@@ -435,6 +435,47 @@ def _iter_translatable_blocks(soup: BeautifulSoup) -> Iterable:
             yield block
 
 
+def _direct_visible_text_nodes(block) -> List:
+    if block.find_parent(EXCLUDED_TEXT_PARENTS):
+        return []
+
+    nodes = []
+    for node in block.children:
+        if not isinstance(node, NavigableString):
+            continue
+        text = _normalize_text(str(node))
+        if text:
+            nodes.append(node)
+    return nodes
+
+
+def _direct_visible_text_for_block(block) -> str:
+    return _normalize_source_text(
+        " ".join(_normalize_text(str(node)) for node in _direct_visible_text_nodes(block))
+    )
+
+
+def _iter_translatable_block_units(soup: BeautifulSoup) -> Iterable:
+    for block in soup.find_all(BLOCK_TAGS):
+        if block.find(BLOCK_TAGS):
+            text = _direct_visible_text_for_block(block)
+            if _is_translatable_text(text):
+                yield {
+                    "unit_mode": "direct_text",
+                    "block": block,
+                    "text": text,
+                }
+            continue
+
+        text = _visible_text_for_block(block)
+        if _is_translatable_text(text):
+            yield {
+                "unit_mode": "block",
+                "block": block,
+                "text": text,
+            }
+
+
 def _iter_translatable_text_nodes(soup: BeautifulSoup) -> Iterable:
     for node in soup.find_all(string=True):
         if not isinstance(node, NavigableString):
@@ -677,7 +718,36 @@ def _has_linked_descendant(block) -> bool:
     return bool(block.find(LINK_PRESERVING_TAGS))
 
 
+def _normal_link_text_node(node) -> bool:
+    if not isinstance(node, NavigableString):
+        return False
+    parent = node.parent
+    if parent is None or _local_tag_name(parent) != "a":
+        return False
+    if _is_structural_note_link(parent):
+        return False
+    return _is_translatable_text(str(node))
+
+
 def _replace_block_text_preserving_links(block, translated_text: str) -> None:
+    link_text_node = None
+    for node in block.find_all(string=True):
+        if _normal_link_text_node(node):
+            link_text_node = node
+            break
+
+    if link_text_node is not None:
+        link = link_text_node.parent
+        link.clear()
+        link.append(translated_text)
+        for node in list(block.find_all(string=True)):
+            if not _is_visible_text_node(node):
+                continue
+            if node.parent is link:
+                continue
+            node.replace_with("")
+        return
+
     first_text_node = None
     for node in block.find_all(string=True):
         if not isinstance(node, NavigableString):
@@ -696,6 +766,15 @@ def _replace_block_text_preserving_links(block, translated_text: str) -> None:
         first_text_node.replace_with(translated_text)
     else:
         block.insert(0, translated_text)
+
+
+def _replace_direct_text_nodes(unit: Dict, translated_text: str) -> None:
+    nodes = _direct_visible_text_nodes(unit["block"])
+    if not nodes:
+        return
+    nodes[0].replace_with(translated_text)
+    for node in nodes[1:]:
+        node.replace_with("")
 
 
 def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
@@ -717,14 +796,16 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
         content = item.get_content()
         soup = _parse_html(content)
         blocks = []
-        candidates = list(_iter_translatable_blocks(soup))
-        extraction_mode = "blocks"
+        candidates = list(_iter_translatable_block_units(soup))
+        extraction_mode = "blocks_with_direct_text"
 
-        for block_index, block in enumerate(candidates):
-            text = _visible_text_for_block(block)
+        for block_index, unit in enumerate(candidates):
+            block = unit["block"]
+            text = unit["text"]
+            unit_mode = unit["unit_mode"]
             tag = block.name
             kind = _infer_block_kind(block, item)
-            if _has_noteref_descendant(block):
+            if unit_mode == "block" and _has_noteref_descendant(block):
                 segment_infos = []
                 for segment in _noteref_text_segments(block):
                     text_lines = split_translation_units(segment["text"])
@@ -750,6 +831,7 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
                         "block_index": block_index,
                         "tag": tag,
                         "kind": kind,
+                        "unit_mode": unit_mode,
                         "original_text": text,
                         "segment_mode": "noteref_text_segments",
                         "segments": segment_infos,
@@ -766,6 +848,7 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
                         "block_index": block_index,
                         "tag": tag,
                         "kind": kind,
+                        "unit_mode": unit_mode,
                         "original_text": text,
                     }
                 )
@@ -1253,6 +1336,8 @@ def _apply_language_and_css_replacements(
 def _blocks_for_manifest_item(soup: BeautifulSoup, extraction_mode: str) -> List:
     if extraction_mode == "text_nodes":
         return list(_iter_translatable_text_nodes(soup))
+    if extraction_mode == "blocks_with_direct_text":
+        return list(_iter_translatable_block_units(soup))
     return list(_iter_translatable_blocks(soup))
 
 
@@ -1353,16 +1438,41 @@ def text_to_epub(
                 manifest_item,
             )
 
-            for block, block_info in zip(blocks, manifest_item["blocks"]):
+            for block_ref, block_info in zip(blocks, manifest_item["blocks"]):
                 translated_text = _translated_text_for_unit(block_info, translated_lines)
                 if extraction_mode == "text_nodes":
                     translated_text = _strip_duplicate_note_number(
                         translated_text,
-                        block.next_sibling,
+                        block_ref.next_sibling,
                     )
-                    block.replace_with(translated_text)
+                    block_ref.replace_with(translated_text)
                 else:
+                    if isinstance(block_ref, dict):
+                        block = block_ref["block"]
+                        unit_mode = block_info.get(
+                            "unit_mode",
+                            block_ref.get("unit_mode", "block"),
+                        )
+                    else:
+                        block = block_ref
+                        unit_mode = block_info.get("unit_mode", "block")
+
                     _apply_noteref_classes(block)
+                    if unit_mode == "direct_text":
+                        translated_text = _strip_leading_duplicate_note_number(
+                            translated_text,
+                            block,
+                        )
+                        translated_text = _strip_duplicate_block_note_number(
+                            translated_text,
+                            block,
+                        )
+                        _replace_direct_text_nodes(
+                            block_ref if isinstance(block_ref, dict) else {"block": block},
+                            translated_text,
+                        )
+                        continue
+
                     _apply_chinese_body_class(block, block_info)
                     if block_info.get("segment_mode") == "noteref_text_segments":
                         _replace_noteref_segmented_block(

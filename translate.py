@@ -765,23 +765,7 @@ def main(
             return "Document context for consistency only:\n" + "\n".join(lines) + "\n\n"
 
         def build_translategemma_text(text, context, terminology_section, document_context_section):
-            reference_parts = []
-            if document_context_section:
-                reference_parts.append(document_context_section.strip())
-            if context:
-                reference_parts.append(
-                    "Reference context for consistency only. Translate only the numbered Text section:\n"
-                    + context.strip()
-                )
-            if terminology_section:
-                reference_parts.append(terminology_section.strip())
-            if not reference_parts:
-                return text
-            return (
-                "\n\n".join(reference_parts)
-                + "\n\nText to translate. Return only the numbered translations:\n"
-                + text
-            )
+            return text
 
         def build_group_text(group):
             return build_numbered_text(source_lines[index] for index in group)
