@@ -44,6 +44,13 @@ LLM_MODEL_TYPE_HINTS = {
 
 TRANSLATEGEMMA_MODEL_FAMILY = "translategemma"
 
+TRANSLATEGEMMA_LANGUAGE_ALIASES = {
+    "zh-cn": ("zh-CN", "zh", "zh-Hans", "zh_CN", "zh_Hans", "cmn"),
+    "zh-hans": ("zh-Hans", "zh", "zh-CN", "zh_CN", "zh_Hans", "cmn"),
+    "zh-tw": ("zh-TW", "zh", "zh-Hant", "zh_TW", "zh_Hant", "cmn"),
+    "zh-hant": ("zh-Hant", "zh", "zh-TW", "zh_TW", "zh_Hant", "cmn"),
+}
+
 TRANSLATION_MODEL_TYPES = {
     "fsmt",
     "m2m_100",
@@ -128,6 +135,31 @@ def build_translategemma_messages(
     ]
 
 
+def translategemma_language_code_candidates(language_code: str) -> List[str]:
+    raw_code = (language_code or "").strip()
+    if not raw_code:
+        return []
+
+    candidates = []
+
+    def add(candidate):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(raw_code)
+    add(raw_code.replace("_", "-"))
+    add(raw_code.replace("-", "_"))
+
+    normalized = raw_code.lower().replace("_", "-")
+    for candidate in TRANSLATEGEMMA_LANGUAGE_ALIASES.get(normalized, ()):
+        add(candidate)
+
+    if "-" in raw_code or "_" in raw_code:
+        add(re.split(r"[-_]", raw_code, maxsplit=1)[0])
+
+    return candidates
+
+
 def apply_translategemma_chat_template_tokenized(
     processor,
     text: str,
@@ -145,6 +177,42 @@ def apply_translategemma_chat_template_tokenized(
         add_generation_prompt=True,
         return_dict=True,
         return_tensors="pt",
+    )
+
+
+def resolve_translategemma_language_codes(
+    processor,
+    source_lang_code: str,
+    target_lang_code: str,
+):
+    source_candidates = translategemma_language_code_candidates(source_lang_code)
+    target_candidates = translategemma_language_code_candidates(target_lang_code)
+    if not source_candidates or not target_candidates:
+        raise ValueError(
+            "TranslateGemma requires non-empty --source_lang_code and --target_lang_code."
+        )
+
+    errors = []
+    for source_candidate in source_candidates:
+        for target_candidate in target_candidates:
+            try:
+                apply_translategemma_chat_template_tokenized(
+                    processor,
+                    "language-code-check",
+                    source_lang_code=source_candidate,
+                    target_lang_code=target_candidate,
+                )
+                return source_candidate, target_candidate
+            except Exception as error:
+                errors.append(
+                    f"{source_candidate}->{target_candidate}: {type(error).__name__}: {error}"
+                )
+
+    raise ValueError(
+        "TranslateGemma rejected the requested language codes. "
+        f"Tried source candidates {source_candidates} and target candidates {target_candidates}. "
+        "Use language codes supported by this model's chat template. "
+        f"First error: {errors[0] if errors else 'unknown'}"
     )
 
 

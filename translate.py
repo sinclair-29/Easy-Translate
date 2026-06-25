@@ -22,6 +22,7 @@ from llm_translation import (
     make_translation_groups,
     parse_numbered_translations,
     read_text_lines,
+    resolve_translategemma_language_codes,
     split_text_for_token_budget,
     tokenize_llm_prompt,
 )
@@ -445,6 +446,23 @@ def main(
         )
     if llm_prompt is not None and "{TEXT}" not in llm_prompt:
         raise ValueError("The --llm_prompt argument must include the {TEXT} placeholder.")
+    requested_source_lang_code = source_lang_code
+    requested_target_lang_code = target_lang_code
+    if use_translategemma:
+        source_lang_code, target_lang_code = resolve_translategemma_language_codes(
+            tokenizer,
+            source_lang_code=source_lang_code,
+            target_lang_code=target_lang_code,
+        )
+        if (
+            source_lang_code != requested_source_lang_code
+            or target_lang_code != requested_target_lang_code
+        ):
+            print(
+                "WARNING: TranslateGemma language codes were normalized from "
+                f"{requested_source_lang_code}->{requested_target_lang_code} to "
+                f"{source_lang_code}->{target_lang_code} for this model's chat template."
+            )
     if context_window < 0:
         raise ValueError("--context_window must be greater than or equal to 0.")
     if merge_max_chars <= 0:

@@ -13,7 +13,9 @@ from llm_translation import (
     make_translation_groups,
     parse_numbered_translations,
     render_chat_prompt,
+    resolve_translategemma_language_codes,
     split_text_for_llm,
+    translategemma_language_code_candidates,
 )
 
 
@@ -47,6 +49,20 @@ class FakeTranslateGemmaProcessor:
         self.return_dict = return_dict
         self.return_tensors = return_tensors
         return {"input_ids": [[4, 5, 6]]}
+
+
+class RestrictedTranslateGemmaProcessor(FakeTranslateGemmaProcessor):
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, return_dict, return_tensors):
+        content = messages[0]["content"][0]
+        if content["target_lang_code"] != "zh":
+            raise KeyError(content["target_lang_code"])
+        return super().apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=return_dict,
+            return_tensors=return_tensors,
+        )
 
 
 class LlmTranslationHelpers(unittest.TestCase):
@@ -154,6 +170,21 @@ class LlmTranslationHelpers(unittest.TestCase):
         self.assertTrue(processor.add_generation_prompt)
         self.assertTrue(processor.return_dict)
         self.assertEqual(processor.return_tensors, "pt")
+
+    def test_translategemma_language_code_candidates_include_base_language(self):
+        self.assertIn("zh", translategemma_language_code_candidates("zh-CN"))
+
+    def test_resolves_translategemma_language_code_alias(self):
+        processor = mark_translategemma_processor(RestrictedTranslateGemmaProcessor())
+
+        source_code, target_code = resolve_translategemma_language_codes(
+            processor,
+            source_lang_code="en",
+            target_lang_code="zh-CN",
+        )
+
+        self.assertEqual(source_code, "en")
+        self.assertEqual(target_code, "zh")
 
     def test_uses_chat_template_when_available(self):
         tokenizer = FakeTokenizer()
