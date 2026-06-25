@@ -16,6 +16,8 @@ import torch
 
 import json
 
+from llm_translation import is_translategemma_name, mark_translategemma_processor
+
 
 UNSUPPORTED_SEQ2SEQ_MODEL_TYPES = {
     "fsmt",
@@ -30,7 +32,8 @@ UNSUPPORTED_SEQ2SEQ_MODEL_TYPES = {
 
 LLM_ONLY_MODEL_ERROR = (
     "This fork/version of Easy-Translate is now LLM-only and expects an "
-    "instruction-tuned CausalLM/chat model such as Qwen3-14B-Instruct. "
+    "instruction-tuned local translation model such as Qwen3-14B-Instruct or "
+    "google/translategemma-12b-it. "
     "Legacy Seq2Seq translation models such as NLLB, M2M100, SeamlessM4T, "
     "MBART, MarianMT, and T5 are no longer supported."
 )
@@ -96,32 +99,12 @@ def load_model_for_inference(
     )
 
     model_type = str(getattr(config, "model_type", "")).lower()
+    is_translategemma = is_translategemma_name(weights_path)
     if getattr(config, "is_encoder_decoder", False) or model_type in UNSUPPORTED_SEQ2SEQ_MODEL_TYPES:
         raise ValueError(
             f"Model {weights_path} has model_type={config.model_type!r}. "
             f"{LLM_ONLY_MODEL_ERROR}"
         )
-
-    from transformers import AutoTokenizer
-
-    tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
-        weights_path, add_eos_token=True, trust_remote_code=trust_remote_code
-    )
-
-    if tokenizer.pad_token_id is None:
-        if "<|padding|>" in tokenizer.get_vocab():
-            # StabilityLM specific fix
-            tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
-        elif tokenizer.unk_token is not None:
-            print(
-                "Tokenizer does not have a pad token, we will use the unk token as pad token."
-            )
-            tokenizer.pad_token_id = tokenizer.unk_token_id
-        else:
-            print(
-                "Tokenizer does not have a pad token. We will use the eos token as pad token."
-            )
-            tokenizer.pad_token_id = tokenizer.eos_token_id
 
     quant_args = {}
 
@@ -149,6 +132,76 @@ def load_model_for_inference(
     else:
         print(f"Loading model with dtype: {torch_dtype}")
         bnb_config = None
+
+    if is_translategemma:
+        try:
+            from transformers import AutoModelForImageTextToText, AutoProcessor
+        except ImportError as error:
+            raise ImportError(
+                "TranslateGemma requires a recent Transformers version with "
+                "AutoProcessor and AutoModelForImageTextToText. Upgrade with: "
+                "pip install --upgrade transformers"
+            ) from error
+
+        processor = AutoProcessor.from_pretrained(
+            weights_path,
+            trust_remote_code=trust_remote_code,
+        )
+        processor = mark_translategemma_processor(processor)
+        if hasattr(processor, "tokenizer"):
+            tokenizer = processor.tokenizer
+            if getattr(tokenizer, "pad_token_id", None) is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            tokenizer.padding_side = "left"
+
+        print(
+            f"Model {weights_path} is a TranslateGemma image-text translation model. "
+            "We will load it with AutoModelForImageTextToText."
+        )
+        model_kwargs = {
+            "pretrained_model_name_or_path": weights_path,
+            "device_map": "auto" if force_auto_device_map else None,
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": trust_remote_code,
+            "quantization_config": bnb_config,
+            **quant_args,
+        }
+        if attn_implementation is not None:
+            model_kwargs["attn_implementation"] = attn_implementation
+        model: PreTrainedModel = AutoModelForImageTextToText.from_pretrained(
+            **model_kwargs
+        )
+
+        if lora_weights_name_or_path:
+            from peft import PeftModel
+
+            print(f"Loading pretrained LORA weights from {lora_weights_name_or_path}")
+            model = PeftModel.from_pretrained(model, lora_weights_name_or_path)
+            if quantization is None:
+                model = model.merge_and_unload()
+
+        return model, processor
+
+    from transformers import AutoTokenizer
+
+    tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+        weights_path, add_eos_token=True, trust_remote_code=trust_remote_code
+    )
+
+    if tokenizer.pad_token_id is None:
+        if "<|padding|>" in tokenizer.get_vocab():
+            # StabilityLM specific fix
+            tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
+        elif tokenizer.unk_token is not None:
+            print(
+                "Tokenizer does not have a pad token, we will use the unk token as pad token."
+            )
+            tokenizer.pad_token_id = tokenizer.unk_token_id
+        else:
+            print(
+                "Tokenizer does not have a pad token. We will use the eos token as pad token."
+            )
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if config.model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
         print(

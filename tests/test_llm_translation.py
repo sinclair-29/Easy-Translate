@@ -3,10 +3,13 @@ from types import SimpleNamespace
 
 from llm_translation import (
     apply_chat_template_tokenized,
+    apply_translategemma_chat_template_tokenized,
     build_context,
     build_llm_prompt,
     build_numbered_text,
+    build_translategemma_messages,
     is_llm_translation_model,
+    mark_translategemma_processor,
     make_translation_groups,
     parse_numbered_translations,
     render_chat_prompt,
@@ -34,6 +37,16 @@ class FakeTokenizedTokenizer:
         self.return_tensors = return_tensors
         self.enable_thinking = enable_thinking
         return [[1, 2, 3]]
+
+
+class FakeTranslateGemmaProcessor:
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, return_dict, return_tensors):
+        self.messages = messages
+        self.tokenize = tokenize
+        self.add_generation_prompt = add_generation_prompt
+        self.return_dict = return_dict
+        self.return_tensors = return_tensors
+        return {"input_ids": [[4, 5, 6]]}
 
 
 class LlmTranslationHelpers(unittest.TestCase):
@@ -94,6 +107,53 @@ class LlmTranslationHelpers(unittest.TestCase):
         self.assertFalse(
             is_llm_translation_model(model, tokenizer, "decapoda/llama-65b-hf")
         )
+
+    def test_detects_translategemma_processor(self):
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                is_encoder_decoder=False,
+                model_type="gemma3",
+                architectures=["Gemma3ForConditionalGeneration"],
+            )
+        )
+        processor = mark_translategemma_processor(FakeTranslateGemmaProcessor())
+
+        self.assertTrue(
+            is_llm_translation_model(
+                model,
+                processor,
+                "google/translategemma-12b-it",
+            )
+        )
+
+    def test_translategemma_message_contains_language_codes(self):
+        messages = build_translategemma_messages(
+            text="Hello world.",
+            source_lang_code="en",
+            target_lang_code="zh-CN",
+        )
+
+        content = messages[0]["content"][0]
+        self.assertEqual(content["type"], "text")
+        self.assertEqual(content["source_lang_code"], "en")
+        self.assertEqual(content["target_lang_code"], "zh-CN")
+        self.assertEqual(content["text"], "Hello world.")
+
+    def test_translategemma_tokenization_uses_processor_template(self):
+        processor = mark_translategemma_processor(FakeTranslateGemmaProcessor())
+
+        tokenized = apply_translategemma_chat_template_tokenized(
+            processor,
+            "Hello world.",
+            source_lang_code="en",
+            target_lang_code="zh-CN",
+        )
+
+        self.assertEqual(tokenized["input_ids"], [[4, 5, 6]])
+        self.assertTrue(processor.tokenize)
+        self.assertTrue(processor.add_generation_prompt)
+        self.assertTrue(processor.return_dict)
+        self.assertEqual(processor.return_tensors, "pt")
 
     def test_uses_chat_template_when_available(self):
         tokenizer = FakeTokenizer()

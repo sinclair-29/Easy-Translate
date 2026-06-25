@@ -12,11 +12,13 @@ from tqdm import tqdm
 
 from epub_converter import epub_to_text, require_epub_dependencies, text_to_epub
 from llm_translation import (
+    apply_translategemma_chat_template_tokenized,
     build_context,
     build_llm_prompt,
     build_numbered_text,
     estimate_llm_prompt_tokens,
     is_llm_translation_model,
+    is_translategemma_processor,
     make_translation_groups,
     parse_numbered_translations,
     read_text_lines,
@@ -324,6 +326,8 @@ def main(
     prompt: str = None,
     trust_remote_code: bool = False,
     attn_implementation: Optional[str] = None,
+    source_lang_code: str = "en",
+    target_lang_code: str = "zh-CN",
     llm_target_language: str = "Simplified Chinese",
     llm_prompt: str = None,
     context_window: int = 0,
@@ -386,6 +390,8 @@ def main(
         trust_remote_code=trust_remote_code,
         attn_implementation=attn_implementation,
     )
+    use_translategemma = is_translategemma_processor(tokenizer)
+    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
 
     if not is_llm_translation_model(model, tokenizer, model_name):
         raise ValueError(
@@ -431,6 +437,12 @@ def main(
             "--prompt and the legacy %%SENTENCE%% prompting path are no longer "
             "supported in LLM-only mode. Use --llm_prompt with a {TEXT} placeholder instead."
         )
+    if use_translategemma and llm_prompt is not None:
+        raise ValueError(
+            "TranslateGemma uses its own language-code chat template and does not "
+            "support --llm_prompt. Remove --llm_prompt and use "
+            "--source_lang_code/--target_lang_code instead."
+        )
     if llm_prompt is not None and "{TEXT}" not in llm_prompt:
         raise ValueError("The --llm_prompt argument must include the {TEXT} placeholder.")
     if context_window < 0:
@@ -461,13 +473,16 @@ def main(
 
     stop_token_ids = []
     for token in ("<|im_end|>", "<|endoftext|>"):
-        token_id = tokenizer.convert_tokens_to_ids(token)
-        if token_id is not None and token_id != tokenizer.unk_token_id:
+        convert_tokens_to_ids = getattr(text_tokenizer, "convert_tokens_to_ids", None)
+        if not callable(convert_tokens_to_ids):
+            continue
+        token_id = convert_tokens_to_ids(token)
+        if token_id is not None and token_id != getattr(text_tokenizer, "unk_token_id", None):
             stop_token_ids.append(token_id)
     if stop_token_ids:
         gen_kwargs["eos_token_id"] = stop_token_ids
-    if tokenizer.pad_token_id is not None:
-        gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+    if getattr(text_tokenizer, "pad_token_id", None) is not None:
+        gen_kwargs["pad_token_id"] = text_tokenizer.pad_token_id
 
     if accelerator.is_main_process:
         print(
@@ -479,6 +494,9 @@ def main(
             f"Deprecated target_lang argument: {target_lang}\n"
             f"LLM-only translation mode: True\n"
             f"LLM target language: {llm_target_language}\n"
+            f"TranslateGemma mode: {use_translategemma}\n"
+            f"Source language code: {source_lang_code}\n"
+            f"Target language code: {target_lang_code}\n"
             f"Automatic terminology memory: {not disable_auto_terms}\n"
             f"Resume partial translations: {not disable_resume}\n"
             f"Context window: {context_window}\n"
@@ -525,7 +543,10 @@ def main(
         source_lines = read_text_lines(sentences_path)
         unit_metadata = load_epub_unit_metadata(manifest_path, len(source_lines))
         resume_settings = {
+            "model_family": "translategemma" if use_translategemma else "chat_causallm",
             "model_name": model_name,
+            "source_lang_code": source_lang_code,
+            "target_lang_code": target_lang_code,
             "llm_target_language": llm_target_language,
             "llm_prompt": llm_prompt,
             "context_window": context_window,
@@ -567,10 +588,37 @@ def main(
             return
         prepared_model = accelerator.prepare(model)
 
+        def input_ids_to_list(tokenized):
+            if hasattr(tokenized, "keys") and "input_ids" in tokenized:
+                tokenized = tokenized["input_ids"]
+            if hasattr(tokenized, "squeeze"):
+                tokenized = tokenized.squeeze(0)
+            if hasattr(tokenized, "tolist"):
+                tokenized = tokenized.tolist()
+            if isinstance(tokenized, int):
+                return [tokenized]
+            if tokenized and isinstance(tokenized[0], list):
+                tokenized = tokenized[0]
+            return list(tokenized)
+
         def build_llm_batch(prompt_texts, enforce_input_budget=True):
-            encoded_prompts = [
-                tokenize_llm_prompt(tokenizer, prompt_text) for prompt_text in prompt_texts
-            ]
+            if use_translategemma:
+                encoded_prompts = [
+                    input_ids_to_list(
+                        apply_translategemma_chat_template_tokenized(
+                            tokenizer,
+                            prompt_text,
+                            source_lang_code=source_lang_code,
+                            target_lang_code=target_lang_code,
+                        )
+                    )
+                    for prompt_text in prompt_texts
+                ]
+            else:
+                encoded_prompts = [
+                    tokenize_llm_prompt(tokenizer, prompt_text)
+                    for prompt_text in prompt_texts
+                ]
             longest_prompt = max((len(prompt) for prompt in encoded_prompts), default=0)
             if enforce_input_budget and longest_prompt > llm_input_max_length:
                 raise ValueError(
@@ -578,14 +626,14 @@ def main(
                     f"--llm_input_max_length {llm_input_max_length}. Increase "
                     "--llm_input_max_length, reduce --context_window, or disable auto terms."
                 )
-            return tokenizer.pad(
+            return text_tokenizer.pad(
                 {"input_ids": encoded_prompts},
                 padding=True,
                 return_tensors="pt",
             )
 
         def source_token_count(source_text):
-            tokenized = tokenizer(
+            tokenized = text_tokenizer(
                 source_text,
                 add_special_tokens=False,
                 truncation=False,
@@ -598,6 +646,20 @@ def main(
             if input_ids and isinstance(input_ids[0], list):
                 input_ids = input_ids[0]
             return len(input_ids)
+
+        def prompt_token_count(prompt_text):
+            if use_translategemma:
+                return len(
+                    input_ids_to_list(
+                        apply_translategemma_chat_template_tokenized(
+                            tokenizer,
+                            prompt_text,
+                            source_lang_code=source_lang_code,
+                            target_lang_code=target_lang_code,
+                        )
+                    )
+                )
+            return estimate_llm_prompt_tokens(tokenizer, prompt_text)
 
         def dynamic_max_new_tokens(source_text, group_size=1):
             source_tokens = source_token_count(source_text)
@@ -622,14 +684,20 @@ def main(
                 **generation_kwargs,
             )
             generated_tokens = generated_tokens[:, batch["input_ids"].shape[1] :]
-            return tokenizer.batch_decode(
+            decoder = text_tokenizer
+            return decoder.batch_decode(
                 generated_tokens,
                 skip_special_tokens=not keep_special_tokens,
                 clean_up_tokenization_spaces=not keep_tokenization_spaces,
             )
 
         terminology_memory = None
-        if not disable_auto_terms and source_lines:
+        if use_translategemma and not disable_auto_terms:
+            print(
+                "WARNING: Automatic terminology memory is skipped for TranslateGemma "
+                "because its official template is translation-specific."
+            )
+        elif not disable_auto_terms and source_lines:
             terminology_memory = generate_terminology_memory(
                 source_lines=source_lines,
                 unit_metadata=unit_metadata,
@@ -678,6 +746,25 @@ def main(
                 return ""
             return "Document context for consistency only:\n" + "\n".join(lines) + "\n\n"
 
+        def build_translategemma_text(text, context, terminology_section, document_context_section):
+            reference_parts = []
+            if document_context_section:
+                reference_parts.append(document_context_section.strip())
+            if context:
+                reference_parts.append(
+                    "Reference context for consistency only. Translate only the numbered Text section:\n"
+                    + context.strip()
+                )
+            if terminology_section:
+                reference_parts.append(terminology_section.strip())
+            if not reference_parts:
+                return text
+            return (
+                "\n\n".join(reference_parts)
+                + "\n\nText to translate. Return only the numbered translations:\n"
+                + text
+            )
+
         def build_group_text(group):
             return build_numbered_text(source_lines[index] for index in group)
 
@@ -691,17 +778,45 @@ def main(
             if text is None:
                 text = build_group_text(group)
             terminology_section = terminology_section_for(text, context)
+            document_context_section = document_context_section_for(group[0])
+            if use_translategemma:
+                return build_translategemma_text(
+                    text,
+                    context=context,
+                    terminology_section=terminology_section,
+                    document_context_section=document_context_section,
+                )
             return build_llm_prompt(
                 text=text,
                 target_language=llm_target_language,
                 context=context,
                 prompt_template=llm_prompt,
                 terminology_section=terminology_section,
-                document_context_section=document_context_section_for(group[0]),
+                document_context_section=document_context_section,
             )
 
-        def prompt_token_count(prompt_text):
-            return estimate_llm_prompt_tokens(tokenizer, prompt_text)
+        def build_prompt_for_text(
+            text,
+            *,
+            context,
+            document_context_section,
+        ):
+            terminology_section = terminology_section_for(text, context)
+            if use_translategemma:
+                return build_translategemma_text(
+                    text,
+                    context=context,
+                    terminology_section=terminology_section,
+                    document_context_section=document_context_section,
+                )
+            return build_llm_prompt(
+                text=text,
+                target_language=llm_target_language,
+                context=context,
+                prompt_template=llm_prompt,
+                terminology_section=terminology_section,
+                document_context_section=document_context_section,
+            )
 
         def prompt_fits_budget(prompt_text):
             return prompt_token_count(prompt_text) <= llm_input_max_length
@@ -762,13 +877,11 @@ def main(
                 window=context_window,
             )
             full_text = build_numbered_text([source_lines[index]])
-            full_prompt = build_llm_prompt(
-                text=full_text,
-                target_language=llm_target_language,
+            doc_context = document_context_section_for(index)
+            full_prompt = build_prompt_for_text(
+                full_text,
                 context=context,
-                prompt_template=llm_prompt,
-                terminology_section=terminology_section_for(full_text, context),
-                document_context_section=document_context_section_for(index),
+                document_context_section=doc_context,
             )
             if prompt_fits_budget(full_prompt):
                 decoded_output = generate_prompts(
@@ -785,13 +898,10 @@ def main(
 
             def chunk_fits_budget(chunk):
                 chunk_text = build_numbered_text([chunk])
-                chunk_prompt = build_llm_prompt(
-                    text=chunk_text,
-                    target_language=llm_target_language,
+                chunk_prompt = build_prompt_for_text(
+                    chunk_text,
                     context=context,
-                    prompt_template=llm_prompt,
-                    terminology_section=terminology_section_for(chunk_text, context),
-                    document_context_section=document_context_section_for(index),
+                    document_context_section=doc_context,
                 )
                 return prompt_fits_budget(chunk_prompt)
 
@@ -812,13 +922,10 @@ def main(
                 text = build_numbered_text(
                     chunks[chunk_index] for chunk_index in chunk_group
                 )
-                return build_llm_prompt(
-                    text=text,
-                    target_language=llm_target_language,
+                return build_prompt_for_text(
+                    text,
                     context=context,
-                    prompt_template=llm_prompt,
-                    terminology_section=terminology_section_for(text, context),
-                    document_context_section=document_context_section_for(index),
+                    document_context_section=doc_context,
                 )
 
             chunk_groups = make_translation_groups(
@@ -852,13 +959,10 @@ def main(
                     for chunk_index in chunk_group:
                         chunk = chunks[chunk_index]
                         chunk_text = build_numbered_text([chunk])
-                        chunk_prompt = build_llm_prompt(
-                            text=chunk_text,
-                            target_language=llm_target_language,
+                        chunk_prompt = build_prompt_for_text(
+                            chunk_text,
                             context="",
-                            prompt_template=llm_prompt,
-                            terminology_section=terminology_section_for(chunk_text, ""),
-                            document_context_section=document_context_section_for(index),
+                            document_context_section=doc_context,
                         )
                         parsed_chunks.append(
                             generate_prompts(
@@ -1238,6 +1342,20 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--source_lang_code",
+        type=str,
+        default="en",
+        help="Source language code for TranslateGemma, for example en or de-DE.",
+    )
+
+    parser.add_argument(
+        "--target_lang_code",
+        type=str,
+        default="zh-CN",
+        help="Target language code for TranslateGemma, for example zh-CN or de-DE.",
+    )
+
+    parser.add_argument(
         "--llm_target_language",
         type=str,
         default="Simplified Chinese",
@@ -1329,6 +1447,8 @@ if __name__ == "__main__":
         prompt=args.prompt,
         trust_remote_code=args.trust_remote_code,
         attn_implementation=args.attn_implementation,
+        source_lang_code=args.source_lang_code,
+        target_lang_code=args.target_lang_code,
         llm_target_language=args.llm_target_language,
         llm_prompt=args.llm_prompt,
         context_window=args.context_window,

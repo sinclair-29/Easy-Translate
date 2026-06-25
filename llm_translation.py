@@ -42,6 +42,8 @@ LLM_MODEL_TYPE_HINTS = {
     "stablelm",
 }
 
+TRANSLATEGEMMA_MODEL_FAMILY = "translategemma"
+
 TRANSLATION_MODEL_TYPES = {
     "fsmt",
     "m2m_100",
@@ -54,7 +56,26 @@ TRANSLATION_MODEL_TYPES = {
 }
 
 
+def is_translategemma_name(model_name: str) -> bool:
+    return "translategemma" in (model_name or "").lower()
+
+
+def mark_translategemma_processor(processor):
+    setattr(processor, "_easytranslate_model_family", TRANSLATEGEMMA_MODEL_FAMILY)
+    return processor
+
+
+def is_translategemma_processor(tokenizer_or_processor) -> bool:
+    return (
+        getattr(tokenizer_or_processor, "_easytranslate_model_family", None)
+        == TRANSLATEGEMMA_MODEL_FAMILY
+    )
+
+
 def is_llm_translation_model(model, tokenizer, model_name: str) -> bool:
+    if is_translategemma_processor(tokenizer):
+        return True
+
     config = getattr(model, "config", None)
     if getattr(config, "is_encoder_decoder", False):
         return False
@@ -85,6 +106,46 @@ def is_llm_translation_model(model, tokenizer, model_name: str) -> bool:
     )
 
     return has_chat_template or (has_llm_name and (has_llm_type or has_llm_architecture))
+
+
+def build_translategemma_messages(
+    text: str,
+    source_lang_code: str,
+    target_lang_code: str,
+):
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "source_lang_code": source_lang_code,
+                    "target_lang_code": target_lang_code,
+                    "text": text,
+                }
+            ],
+        }
+    ]
+
+
+def apply_translategemma_chat_template_tokenized(
+    processor,
+    text: str,
+    source_lang_code: str,
+    target_lang_code: str,
+):
+    messages = build_translategemma_messages(
+        text=text,
+        source_lang_code=source_lang_code,
+        target_lang_code=target_lang_code,
+    )
+    return processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
 
 
 def read_text_lines(path: str) -> List[str]:

@@ -2,7 +2,7 @@
 
 Easy-Translate is a lightweight LLM-only translation tool for large text files
 and EPUB books. This fork focuses on instruction-tuned CausalLM/chat models such
-as Qwen3-14B-Instruct and Qwen2.5-Instruct.
+as google/translategemma-12b-it, Qwen3-14B-Instruct, and Qwen2.5-Instruct.
 
 Legacy Seq2Seq machine-translation models such as NLLB, M2M100, SeamlessM4T,
 MBART, MarianMT, T5, and similar language-token based models are no longer
@@ -46,7 +46,7 @@ Optional EPUB support:
 pip install ebooklib beautifulsoup4 lxml
 ```
 
-Qwen3 may require a recent Transformers version:
+TranslateGemma and Qwen3 may require a recent Transformers version:
 
 ```bash
 pip install --upgrade transformers
@@ -58,14 +58,15 @@ pip install --upgrade transformers
 python3 translate.py \
   --sentences_path book.epub \
   --output_path book_zh.epub \
-  --model_name /path/to/Qwen3-14B-Instruct \
-  --precision fp16 \
+  --model_name google/translategemma-12b-it \
+  --precision bf16 \
   --starting_batch_size 1 \
-  --context_window 1 \
+  --source_lang_code en \
+  --target_lang_code zh-CN \
   --merge_small_blocks \
-  --llm_input_max_length 8192 \
+  --llm_input_max_length 1800 \
   --llm_chunk_chars 4000 \
-  --max_length 1536
+  --max_length 512
 ```
 
 If the EPUB output path ends in `.txt`, Easy-Translate writes one translated
@@ -95,6 +96,30 @@ python3 translate.py \
 ```
 
 Use `--files_extension epub` to translate EPUB files in a directory.
+
+## TranslateGemma
+
+`google/translategemma-12b-it` is a gated Hugging Face model, so accept the
+Gemma license/model access on Hugging Face before loading it locally. It uses
+language codes instead of the generic `--llm_target_language` prompt path:
+
+```bash
+python3 translate.py \
+  --sentences_path shutdown_minimal.epub \
+  --output_path shutdown_minimal_zh.epub \
+  --model_name google/translategemma-12b-it \
+  --precision bf16 \
+  --starting_batch_size 1 \
+  --source_lang_code en \
+  --target_lang_code zh-CN \
+  --llm_input_max_length 1800 \
+  --max_length 512
+```
+
+TranslateGemma uses its official language-code chat template, so `--llm_prompt`
+is not supported for this model. Use codes such as `en`, `zh-CN`, or `de-DE`.
+Because the model context is about 2K tokens, keep `--llm_input_max_length`
+around `1800`.
 
 ## LLM Prompting
 
@@ -142,7 +167,9 @@ Disable this step with `--disable_auto_terms`.
 ## Useful Runtime Options
 
 - `--model_name`: local path or Hugging Face model name for an instruction-tuned
-  CausalLM/chat model.
+  local translation model.
+- `--source_lang_code`, `--target_lang_code`: TranslateGemma language codes,
+  such as `en` and `zh-CN`.
 - `--precision`: `bf16`, `fp16`, `32`, `8`, or `4`.
 - `--attn_implementation`: optional HuggingFace attention implementation.
   Use `flash_attention_2` when FlashAttention-2 is installed, or `sdpa` as the
