@@ -161,6 +161,9 @@ Disable this step with `--disable_auto_terms`.
   source blocks after token-budget checks.
 - `--disable_auto_terms`: skip automatic terminology memory generation and
   prompt injection.
+- Resume is enabled by default. Partial translations are saved during long runs
+  and reused after OOM batch-size retries or command restarts. Use
+  `--disable_resume` to ignore the partial cache and translate from scratch.
 - `--do_sample`, `--temperature`, `--top_k`, `--top_p`: optional sampling
   controls. Sampling parameters are only sent to the model when `--do_sample` is
   enabled.

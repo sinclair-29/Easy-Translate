@@ -102,6 +102,9 @@ NOTE_LINK_CLASSES = {
     "class_19502",
     "class_19515",
 }
+BACKLINK_CLASSES = {
+    "backlink",
+}
 LINK_PRESERVING_TAGS = {
     "a",
     "audio",
@@ -408,6 +411,21 @@ def _visible_text_for_block(block) -> str:
     return _normalize_source_text(" ".join(parts))
 
 
+def _is_visible_text_node(node) -> bool:
+    if not isinstance(node, NavigableString):
+        return False
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.name and parent.name.lower() in EXCLUDED_TEXT_PARENTS:
+        return False
+    if parent.find_parent(EXCLUDED_TEXT_PARENTS):
+        return False
+    if _is_structural_note_link(parent):
+        return False
+    return bool(_normalize_text(str(node)))
+
+
 def _iter_translatable_blocks(soup: BeautifulSoup) -> Iterable:
     for block in soup.find_all(BLOCK_TAGS):
         if block.find(BLOCK_TAGS):
@@ -436,7 +454,7 @@ def _iter_translatable_text_nodes(soup: BeautifulSoup) -> Iterable:
 
 
 def _is_numeric_text(text: str) -> bool:
-    return bool(re.fullmatch(r"[\[\(]?\d{1,4}[\]\)]?", _normalize_text(text)))
+    return bool(re.fullmatch(r"[\[\(]?\d{1,4}[\]\)]?\.?", _normalize_text(text)))
 
 
 def _tag_classes(tag) -> set:
@@ -482,13 +500,24 @@ def _is_noteref_link(tag) -> bool:
     )
 
 
+def _is_backlink_note_link(tag) -> bool:
+    if tag is None or _local_tag_name(tag) != "a":
+        return False
+    text = _normalize_text(tag.get_text("", strip=True))
+    if not _is_numeric_text(text):
+        return False
+    classes = _tag_classes(tag)
+    href = str(tag.get("href", "")).lower()
+    return bool(classes & BACKLINK_CLASSES) and bool(href)
+
+
 def _is_structural_note_link(tag) -> bool:
     if tag is None or _local_tag_name(tag) != "a":
         return False
     text = _normalize_text(tag.get_text("", strip=True))
     if not _is_numeric_text(text):
         return False
-    if _is_noteref_link(tag):
+    if _is_noteref_link(tag) or _is_backlink_note_link(tag):
         return True
     href = tag.get("href", "")
     return "#" in href and len(text) <= 4
@@ -534,6 +563,94 @@ def _strip_duplicate_block_note_number(text: str, block) -> str:
         return text
     note_number = re.escape(_normalize_text(note_link.get_text("", strip=True)))
     return re.sub(rf"(?<!\d)\s*{note_number}\s*$", "", text).rstrip()
+
+
+def _strip_duplicate_note_number_for_link(text: str, note_link) -> str:
+    if note_link is None:
+        return text
+    note_number = re.escape(_normalize_text(note_link.get_text("", strip=True)))
+    return re.sub(rf"(?<!\d)\s*{note_number}\s*$", "", text).rstrip()
+
+
+def _leading_structural_note_link(block):
+    for node in block.descendants:
+        if _is_structural_note_link(node):
+            return node
+        if _is_visible_text_node(node):
+            return None
+    return None
+
+
+def _strip_leading_duplicate_note_number(text: str, block) -> str:
+    note_link = _leading_structural_note_link(block)
+    if note_link is None:
+        return text
+    note_number = re.escape(_normalize_text(note_link.get_text("", strip=True)))
+    return re.sub(rf"^\s*{note_number}\s*", "", text, count=1).lstrip()
+
+
+def _has_noteref_descendant(block) -> bool:
+    return bool(block.find(lambda tag: _is_noteref_link(tag)))
+
+
+def _noteref_text_segments(block) -> List[Dict]:
+    segments = []
+    current_nodes = []
+    current_parts = []
+
+    def flush(next_note=None) -> None:
+        nonlocal current_nodes, current_parts
+        text = _normalize_source_text(" ".join(current_parts))
+        if text:
+            segments.append(
+                {
+                    "text": text,
+                    "nodes": current_nodes,
+                    "next_note": next_note,
+                }
+            )
+        current_nodes = []
+        current_parts = []
+
+    for node in block.descendants:
+        if _is_noteref_link(node):
+            flush(next_note=node)
+            continue
+        if not _is_visible_text_node(node):
+            continue
+        current_nodes.append(node)
+        current_parts.append(_normalize_text(str(node)))
+
+    flush()
+    return segments
+
+
+def _replace_noteref_segmented_block(
+    block,
+    block_info: Dict,
+    translated_lines: List[str],
+) -> None:
+    segments = _noteref_text_segments(block)
+    segment_infos = block_info.get("segments", [])
+    if len(segments) != len(segment_infos):
+        raise ValueError(
+            "EPUB note segment structure changed while rebuilding "
+            f"block {block_info.get('block_index')}: expected "
+            f"{len(segment_infos)} segments, found {len(segments)}"
+        )
+
+    for segment, segment_info in zip(segments, segment_infos):
+        translated_text = _translated_text_for_unit(segment_info, translated_lines)
+        translated_text = _strip_duplicate_note_number_for_link(
+            translated_text,
+            segment.get("next_note"),
+        )
+        nodes = segment["nodes"]
+        if not nodes:
+            continue
+        nodes[0].replace_with(translated_text)
+        for node in nodes[1:]:
+            node.replace_with("")
 
 
 def _strip_duplicate_note_number(text: str, next_node) -> str:
@@ -607,20 +724,52 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
             text = _visible_text_for_block(block)
             tag = block.name
             kind = _infer_block_kind(block, item)
-            text_lines = split_translation_units(text)
-            if not text_lines:
-                continue
-            blocks.append(
-                {
-                    "line": len(lines),
-                    "lines": len(text_lines),
-                    "block_index": block_index,
-                    "tag": tag,
-                    "kind": kind,
-                    "original_text": text,
-                }
-            )
-            lines.extend(text_lines)
+            if _has_noteref_descendant(block):
+                segment_infos = []
+                for segment in _noteref_text_segments(block):
+                    text_lines = split_translation_units(segment["text"])
+                    if not text_lines:
+                        continue
+                    segment_infos.append(
+                        {
+                            "line": len(lines),
+                            "lines": len(text_lines),
+                            "original_text": segment["text"],
+                        }
+                    )
+                    lines.extend(text_lines)
+                if not segment_infos:
+                    continue
+                blocks.append(
+                    {
+                        "line": segment_infos[0]["line"],
+                        "lines": sum(
+                            segment_info.get("lines", 1)
+                            for segment_info in segment_infos
+                        ),
+                        "block_index": block_index,
+                        "tag": tag,
+                        "kind": kind,
+                        "original_text": text,
+                        "segment_mode": "noteref_text_segments",
+                        "segments": segment_infos,
+                    }
+                )
+            else:
+                text_lines = split_translation_units(text)
+                if not text_lines:
+                    continue
+                blocks.append(
+                    {
+                        "line": len(lines),
+                        "lines": len(text_lines),
+                        "block_index": block_index,
+                        "tag": tag,
+                        "kind": kind,
+                        "original_text": text,
+                    }
+                )
+                lines.extend(text_lines)
 
         if blocks:
             manifest["items"].append(
@@ -1215,13 +1364,31 @@ def text_to_epub(
                 else:
                     _apply_noteref_classes(block)
                     _apply_chinese_body_class(block, block_info)
-                    translated_text = _strip_duplicate_block_note_number(
-                        translated_text,
-                        block,
-                    )
-                    if _has_linked_descendant(block):
+                    if block_info.get("segment_mode") == "noteref_text_segments":
+                        _replace_noteref_segmented_block(
+                            block,
+                            block_info,
+                            translated_lines,
+                        )
+                    elif _has_linked_descendant(block):
+                        translated_text = _strip_leading_duplicate_note_number(
+                            translated_text,
+                            block,
+                        )
+                        translated_text = _strip_duplicate_block_note_number(
+                            translated_text,
+                            block,
+                        )
                         _replace_block_text_preserving_links(block, translated_text)
                     else:
+                        translated_text = _strip_leading_duplicate_note_number(
+                            translated_text,
+                            block,
+                        )
+                        translated_text = _strip_duplicate_block_note_number(
+                            translated_text,
+                            block,
+                        )
                         block.clear()
                         block.append(translated_text)
 

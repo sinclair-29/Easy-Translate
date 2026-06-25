@@ -62,6 +62,64 @@ class LinkPreservingReplacement(unittest.TestCase):
         self.assertIn('href="chapter2.xhtml"', str(block))
         self.assertIn("<a", str(block))
 
+    def test_noteref_segment_replacement_keeps_notes_near_segments(self):
+        soup = epub_converter.BeautifulSoup(
+            '<p>First claim<a class="noteref" epub:type="noteref" '
+            'href="notes.xhtml#n1">1</a> Second claim'
+            '<a class="noteref" epub:type="noteref" href="notes.xhtml#n2">2</a>'
+            " Tail text.</p>",
+            "html.parser",
+        )
+        block = soup.find("p")
+        segments = epub_converter._noteref_text_segments(block)
+        self.assertEqual(
+            [segment["text"] for segment in segments],
+            ["First claim", "Second claim", "Tail text."],
+        )
+
+        block_info = {
+            "block_index": 0,
+            "segments": [
+                {"line": 0, "lines": 1},
+                {"line": 1, "lines": 1},
+                {"line": 2, "lines": 1},
+            ],
+        }
+        epub_converter._apply_noteref_classes(block)
+        epub_converter._replace_noteref_segmented_block(
+            block,
+            block_info,
+            ["第一处论断", "第二处论断", "尾部文字。"],
+        )
+
+        rebuilt = str(block)
+        self.assertLess(rebuilt.index("第一处论断"), rebuilt.index(">1<"))
+        self.assertLess(rebuilt.index(">1<"), rebuilt.index("第二处论断"))
+        self.assertLess(rebuilt.index("第二处论断"), rebuilt.index(">2<"))
+        self.assertLess(rebuilt.index(">2<"), rebuilt.index("尾部文字。"))
+
+    def test_backlink_number_is_structural_not_translatable_text(self):
+        soup = epub_converter.BeautifulSoup(
+            '<p><a class="backlink" href="chapter.xhtml#note7">7.</a> '
+            "7. Citation text.</p>",
+            "html.parser",
+        )
+        block = soup.find("p")
+
+        self.assertEqual(epub_converter._visible_text_for_block(block), "Citation text.")
+
+        translated = epub_converter._strip_leading_duplicate_note_number(
+            "7. 引文文本。",
+            block,
+        )
+        epub_converter._replace_block_text_preserving_links(block, translated)
+
+        rebuilt = str(block)
+        self.assertIn(">7.<", rebuilt)
+        self.assertIn("引文文本。", rebuilt)
+        self.assertNotIn(">7.<a", rebuilt)
+        self.assertNotIn("7. 引文文本", rebuilt)
+
 
 @unittest.skipIf(epub_converter.BeautifulSoup is None, "BeautifulSoup is not installed")
 class XhtmlParsing(unittest.TestCase):
@@ -246,7 +304,8 @@ class EpubConverter(unittest.TestCase):
             self.assertIn("Enlace al texto del capitulo.", chapter)
             self.assertNotIn("Frase con nota 1", chapter)
             self.assertIn("Frase con nota", chapter)
-            self.assertIn('class="class_16563"', chapter)
+            self.assertIn("class_16563", chapter)
+            self.assertIn("easytranslate-noteref", chapter)
             self.assertIn("Texto de div. Mas texto de div.", chapter)
             self.assertEqual(rebuilt.get_metadata("DC", "language")[0][0], "zh-Hans")
 

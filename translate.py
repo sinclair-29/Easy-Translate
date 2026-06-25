@@ -1,10 +1,10 @@
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
-import shutil
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 from accelerate import Accelerator, find_executable_batch_size
@@ -59,6 +59,8 @@ def get_epub_work_paths(input_path: str, output_path: str):
         "work_dir": work_dir,
         "source_text": os.path.join(work_dir, "source.txt"),
         "translated_text": os.path.join(work_dir, "translated.txt"),
+        "partial_text": os.path.join(work_dir, "translated.partial.jsonl"),
+        "partial_meta": os.path.join(work_dir, "translated.partial.meta.json"),
         "manifest": os.path.join(work_dir, "manifest.json"),
         "terms": os.path.join(work_dir, "terms.json"),
         "input_epub": input_path,
@@ -68,6 +70,103 @@ def get_epub_work_paths(input_path: str, output_path: str):
 
 def get_terms_path(output_path: str) -> str:
     return os.path.abspath(output_path) + ".easytranslate_terms.json"
+
+
+def get_partial_paths(output_path: str):
+    absolute_output_path = os.path.abspath(output_path)
+    return {
+        "partial_text": absolute_output_path + ".easytranslate_partial.jsonl",
+        "partial_meta": absolute_output_path + ".easytranslate_partial.meta.json",
+    }
+
+
+def source_lines_sha256(source_lines: List[str]) -> str:
+    digest = hashlib.sha256()
+    for line in source_lines:
+        digest.update(line.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def build_resume_meta(source_lines: List[str], settings: Dict) -> Dict:
+    return {
+        "version": 1,
+        "source_sha256": source_lines_sha256(source_lines),
+        "line_count": len(source_lines),
+        "settings": settings,
+    }
+
+
+def load_partial_translations(
+    partial_text_path: Optional[str],
+    partial_meta_path: Optional[str],
+    expected_meta: Dict,
+    total_lines: int,
+) -> List[Optional[str]]:
+    translations: List[Optional[str]] = [None] * total_lines
+    if not partial_text_path or not partial_meta_path:
+        return translations
+    if not os.path.exists(partial_text_path) or not os.path.exists(partial_meta_path):
+        return translations
+
+    def clear_partial_text() -> None:
+        try:
+            if os.path.exists(partial_text_path):
+                os.remove(partial_text_path)
+        except OSError:
+            pass
+
+    try:
+        with open(partial_meta_path, "r", encoding="utf-8") as meta_file:
+            existing_meta = json.load(meta_file)
+    except (OSError, json.JSONDecodeError):
+        print("WARNING: Could not read resume metadata. Ignoring partial translations.")
+        clear_partial_text()
+        return translations
+
+    if existing_meta != expected_meta:
+        print("Resume metadata does not match current input/settings. Ignoring partial translations.")
+        clear_partial_text()
+        return translations
+
+    loaded = 0
+    try:
+        with open(partial_text_path, "r", encoding="utf-8") as partial_file:
+            for line in partial_file:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                index = record.get("index")
+                text = record.get("text")
+                if isinstance(index, int) and 0 <= index < total_lines and isinstance(text, str):
+                    if translations[index] is None:
+                        loaded += 1
+                    translations[index] = text
+    except OSError:
+        print("WARNING: Could not read partial translations. Ignoring resume cache.")
+        clear_partial_text()
+        return [None] * total_lines
+
+    if loaded:
+        print(f"Loaded {loaded}/{total_lines} completed translations from resume cache.")
+    return translations
+
+
+def write_partial_meta(partial_meta_path: Optional[str], resume_meta: Dict) -> None:
+    if not partial_meta_path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(partial_meta_path)), exist_ok=True)
+    with open(partial_meta_path, "w", encoding="utf-8") as meta_file:
+        json.dump(resume_meta, meta_file, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def append_partial_translation(partial_file, index: int, text: str) -> None:
+    print(
+        json.dumps({"index": index, "text": text}, ensure_ascii=False),
+        file=partial_file,
+    )
+    partial_file.flush()
 
 
 def get_epub_language_code(llm_target_language: str) -> str:
@@ -233,6 +332,7 @@ def main(
     llm_input_max_length: int = 8192,
     llm_chunk_chars: int = 3000,
     disable_auto_terms: bool = False,
+    disable_resume: bool = False,
 ):
     accelerator = Accelerator()
 
@@ -380,6 +480,7 @@ def main(
             f"LLM-only translation mode: True\n"
             f"LLM target language: {llm_target_language}\n"
             f"Automatic terminology memory: {not disable_auto_terms}\n"
+            f"Resume partial translations: {not disable_resume}\n"
             f"Context window: {context_window}\n"
             f"Merge small blocks: {merge_small_blocks}\n"
             f"LLM input max length: {llm_input_max_length}\n"
@@ -411,6 +512,8 @@ def main(
         output_path,
         manifest_path=None,
         terms_path=None,
+        partial_text_path=None,
+        partial_meta_path=None,
     ):
         nonlocal model, tokenizer, max_length, gen_kwargs
 
@@ -421,7 +524,47 @@ def main(
         print(f"Translating {sentences_path} with LLM batch size {batch_size}")
         source_lines = read_text_lines(sentences_path)
         unit_metadata = load_epub_unit_metadata(manifest_path, len(source_lines))
-        translations = [None] * len(source_lines)
+        resume_settings = {
+            "model_name": model_name,
+            "llm_target_language": llm_target_language,
+            "llm_prompt": llm_prompt,
+            "context_window": context_window,
+            "merge_small_blocks": merge_small_blocks,
+            "merge_max_chars": merge_max_chars,
+            "llm_input_max_length": llm_input_max_length,
+            "llm_chunk_chars": llm_chunk_chars,
+            "disable_auto_terms": disable_auto_terms,
+            "max_length": max_length,
+            "num_beams": num_beams,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            "keep_special_tokens": keep_special_tokens,
+            "keep_tokenization_spaces": keep_tokenization_spaces,
+        }
+        resume_meta = build_resume_meta(source_lines, resume_settings)
+        if disable_resume:
+            translations = [None] * len(source_lines)
+        else:
+            translations = load_partial_translations(
+                partial_text_path,
+                partial_meta_path,
+                resume_meta,
+                len(source_lines),
+            )
+            write_partial_meta(partial_meta_path, resume_meta)
+        completed_count = sum(translation is not None for translation in translations)
+        if completed_count == len(source_lines):
+            print("All translations loaded from resume cache.")
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            with open(output_path, "w", encoding="utf-8") as output_file:
+                for translated_text in translations:
+                    print(encode_string(translated_text or ""), file=output_file)
+            accelerator.wait_for_everyone()
+            print(f"Translation done. Output written to {output_path}\n")
+            return
         prepared_model = accelerator.prepare(model)
 
         def build_llm_batch(prompt_texts, enforce_input_budget=True):
@@ -573,6 +716,15 @@ def main(
             unit_metadata=unit_metadata,
             fits_budget=group_fits_budget,
         )
+        resumable_groups = []
+        for group in groups:
+            missing_group = [index for index in group if translations[index] is None]
+            if not missing_group:
+                continue
+            if len(missing_group) == len(group):
+                resumable_groups.append(group)
+            else:
+                resumable_groups.extend([index] for index in missing_group)
 
         def build_group_record(group):
             source_text = build_group_text(group)
@@ -595,7 +747,7 @@ def main(
                 ),
             }
 
-        group_records = [build_group_record(group) for group in groups]
+        group_records = [build_group_record(group) for group in resumable_groups]
         group_records = sorted(
             enumerate(group_records),
             key=lambda item: (item[1]["token_count"], item[0]),
@@ -720,68 +872,109 @@ def main(
                 translated_chunks.extend(parsed_chunks)
             return " ".join(chunk.strip() for chunk in translated_chunks if chunk.strip())
 
-        with tqdm(
-            total=len(source_lines),
-            desc="LLM translation",
-            leave=True,
-            ascii=True,
-        ) as pbar, open(output_path, "w", encoding="utf-8") as output_file:
-            with torch.no_grad():
-                for group_start in range(0, len(group_records), batch_size):
-                    batch_records = group_records[group_start : group_start + batch_size]
-                    ready_records = [
-                        record for record in batch_records if record["prompt"] is not None
-                    ]
-                    if ready_records:
-                        batch_max_new_tokens = max(
-                            record["max_new_tokens"] for record in ready_records
-                        )
-                        decoded_outputs = generate_prompts(
-                            [record["prompt"] for record in ready_records],
-                            max_new_tokens=batch_max_new_tokens,
-                        )
-                    else:
-                        decoded_outputs = []
+        partial_file = None
+        if not disable_resume and partial_text_path:
+            os.makedirs(os.path.dirname(os.path.abspath(partial_text_path)), exist_ok=True)
+            partial_file = open(partial_text_path, "a", encoding="utf-8")
 
-                    decoded_by_group = {
-                        tuple(record["group"]): decoded_output
-                        for record, decoded_output in zip(ready_records, decoded_outputs)
-                    }
+        def record_translation(index: int, text: str) -> None:
+            text = text.strip()
+            translations[index] = text
+            if partial_file is not None:
+                append_partial_translation(partial_file, index, text)
 
-                    for record in batch_records:
-                        group = record["group"]
-                        decoded_output = decoded_by_group.get(tuple(group))
-                        if decoded_output is None:
-                            translations[group[0]] = translate_single_line(group[0])
-                            pbar.update(1)
-                            continue
+        try:
+            with tqdm(
+                total=len(source_lines),
+                initial=completed_count,
+                desc="LLM translation",
+                leave=True,
+                ascii=True,
+            ) as pbar:
+                with torch.no_grad():
+                    for group_start in range(0, len(group_records), batch_size):
+                        batch_records = group_records[group_start : group_start + batch_size]
+                        ready_records = [
+                            record
+                            for record in batch_records
+                            if record["prompt"] is not None
+                        ]
+                        if ready_records:
+                            batch_max_new_tokens = max(
+                                record["max_new_tokens"] for record in ready_records
+                            )
+                            decoded_outputs = generate_prompts(
+                                [record["prompt"] for record in ready_records],
+                                max_new_tokens=batch_max_new_tokens,
+                            )
+                        else:
+                            decoded_outputs = []
 
-                        if len(group) == 1:
+                        decoded_by_group = {
+                            tuple(record["group"]): decoded_output
+                            for record, decoded_output in zip(
+                                ready_records,
+                                decoded_outputs,
+                            )
+                        }
+
+                        for record in batch_records:
+                            group = record["group"]
+                            decoded_output = decoded_by_group.get(tuple(group))
+                            if decoded_output is None:
+                                record_translation(
+                                    group[0],
+                                    translate_single_line(group[0]),
+                                )
+                                pbar.update(1)
+                                continue
+
+                            if len(group) == 1:
+                                try:
+                                    parsed_outputs = parse_numbered_translations(
+                                        decoded_output,
+                                        expected_count=1,
+                                    )
+                                    record_translation(
+                                        group[0],
+                                        parsed_outputs[0],
+                                    )
+                                except ValueError:
+                                    record_translation(
+                                        group[0],
+                                        translate_single_line(group[0]),
+                                    )
+                                pbar.update(1)
+                                continue
+
                             try:
                                 parsed_outputs = parse_numbered_translations(
                                     decoded_output,
-                                    expected_count=1,
+                                    expected_count=len(group),
                                 )
-                                translations[group[0]] = parsed_outputs[0].strip()
                             except ValueError:
-                                translations[group[0]] = translate_single_line(group[0])
-                            pbar.update(1)
-                            continue
+                                parsed_outputs = [
+                                    translate_single_line(index) for index in group
+                                ]
 
-                        try:
-                            parsed_outputs = parse_numbered_translations(
-                                decoded_output,
-                                expected_count=len(group),
-                            )
-                        except ValueError:
-                            parsed_outputs = [
-                                translate_single_line(index) for index in group
-                            ]
+                            for index, translated_text in zip(group, parsed_outputs):
+                                record_translation(index, translated_text)
+                            pbar.update(len(group))
+        finally:
+            if partial_file is not None:
+                partial_file.close()
 
-                        for index, translated_text in zip(group, parsed_outputs):
-                            translations[index] = translated_text.strip()
-                        pbar.update(len(group))
+        missing_indexes = [
+            index for index, translated_text in enumerate(translations)
+            if translated_text is None
+        ]
+        if missing_indexes:
+            raise RuntimeError(
+                "Translation finished with missing cached lines: "
+                + ", ".join(str(index + 1) for index in missing_indexes[:10])
+            )
 
+        with open(output_path, "w", encoding="utf-8") as output_file:
             for translated_text in translations:
                 print(encode_string(translated_text or ""), file=output_file)
 
@@ -794,18 +987,21 @@ def main(
         translation_input_path = input_path
         translation_output_path = final_output_path
         terms_path = get_terms_path(final_output_path)
+        partial_paths = get_partial_paths(final_output_path)
 
         if is_epub_path(input_path):
             epub_work_paths = get_epub_work_paths(input_path, final_output_path)
             translation_input_path = epub_work_paths["source_text"]
             translation_manifest_path = epub_work_paths["manifest"]
             terms_path = epub_work_paths["terms"]
+            partial_paths = {
+                "partial_text": epub_work_paths["partial_text"],
+                "partial_meta": epub_work_paths["partial_meta"],
+            }
             if is_epub_path(final_output_path):
                 translation_output_path = epub_work_paths["translated_text"]
 
             if accelerator.is_main_process:
-                if os.path.exists(epub_work_paths["work_dir"]):
-                    shutil.rmtree(epub_work_paths["work_dir"])
                 os.makedirs(epub_work_paths["work_dir"], exist_ok=True)
                 epub_to_text(
                     epub_path=input_path,
@@ -816,11 +1012,19 @@ def main(
             accelerator.wait_for_everyone()
 
         os.makedirs(os.path.abspath(os.path.dirname(final_output_path)), exist_ok=True)
+        if disable_resume and accelerator.is_main_process:
+            for partial_path in partial_paths.values():
+                if partial_path and os.path.exists(partial_path):
+                    os.remove(partial_path)
+        accelerator.wait_for_everyone()
+
         llm_inference(
             sentences_path=translation_input_path,
             output_path=translation_output_path,
             manifest_path=translation_manifest_path,
             terms_path=terms_path,
+            partial_text_path=partial_paths["partial_text"],
+            partial_meta_path=partial_paths["partial_meta"],
         )
         accelerator.wait_for_everyone()
 
@@ -1092,6 +1296,12 @@ if __name__ == "__main__":
         help="Disable automatic terminology memory generation and prompt injection.",
     )
 
+    parser.add_argument(
+        "--disable_resume",
+        action="store_true",
+        help="Disable partial translation resume cache and translate from scratch.",
+    )
+
     args = parser.parse_args()
 
     main(
@@ -1127,4 +1337,5 @@ if __name__ == "__main__":
         llm_input_max_length=args.llm_input_max_length,
         llm_chunk_chars=args.llm_chunk_chars,
         disable_auto_terms=args.disable_auto_terms,
+        disable_resume=args.disable_resume,
     )
