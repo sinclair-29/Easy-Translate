@@ -523,6 +523,7 @@ def _is_noteref_link(tag) -> bool:
     classes = _tag_classes(tag)
     epub_types = _epub_type_values(tag)
     href = str(tag.get("href", "")).lower()
+    fragment = href.rsplit("#", 1)[-1] if "#" in href else ""
     link_context = " ".join(
         str(value).lower()
         for value in (
@@ -538,6 +539,7 @@ def _is_noteref_link(tag) -> bool:
         or "footnote" in epub_types
         or "endnote" in epub_types
         or ("#" in href and any(hint in link_context for hint in NOTE_HINTS))
+        or bool(re.fullmatch(r"(?:n|fn|note|footnote|endnote)[-_]?\d{1,5}", fragment))
     )
 
 
@@ -552,16 +554,39 @@ def _is_backlink_note_link(tag) -> bool:
     return bool(classes & BACKLINK_CLASSES) and bool(href)
 
 
+def _link_href_fragment(tag) -> str:
+    href = str(tag.get("href", ""))
+    if "#" not in href:
+        return ""
+    return href.rsplit("#", 1)[-1].lower()
+
+
+def _is_index_locator_link(tag) -> bool:
+    if tag is None or _local_tag_name(tag) != "a":
+        return False
+    text = _normalize_text(tag.get_text("", strip=True))
+    if not _is_numeric_text(text):
+        return False
+    epub_types = _epub_type_values(tag)
+    if "index-locator" in epub_types or "pagebreak" in epub_types:
+        return True
+    fragment = _link_href_fragment(tag)
+    return bool(re.fullmatch(r"p\d{1,5}", fragment))
+
+
 def _is_structural_note_link(tag) -> bool:
     if tag is None or _local_tag_name(tag) != "a":
         return False
     text = _normalize_text(tag.get_text("", strip=True))
     if not _is_numeric_text(text):
         return False
-    if _is_noteref_link(tag) or _is_backlink_note_link(tag):
+    if (
+        _is_noteref_link(tag)
+        or _is_backlink_note_link(tag)
+        or _is_index_locator_link(tag)
+    ):
         return True
-    href = tag.get("href", "")
-    return "#" in href and len(text) <= 4
+    return False
 
 
 def _ensure_noteref_class(tag) -> None:
@@ -718,34 +743,53 @@ def _has_linked_descendant(block) -> bool:
     return bool(block.find(LINK_PRESERVING_TAGS))
 
 
-def _normal_link_text_node(node) -> bool:
-    if not isinstance(node, NavigableString):
-        return False
-    parent = node.parent
-    if parent is None or _local_tag_name(parent) != "a":
-        return False
-    if _is_structural_note_link(parent):
-        return False
-    return _is_translatable_text(str(node))
+def _closest_normal_link(node):
+    parent = getattr(node, "parent", None)
+    while parent is not None and getattr(parent, "name", None):
+        if _local_tag_name(parent) == "a":
+            if _is_structural_note_link(parent):
+                return None
+            return parent
+        parent = parent.parent
+    return None
+
+
+def _single_normal_link_for_visible_text(block):
+    visible_nodes = [
+        node for node in block.find_all(string=True)
+        if _is_visible_text_node(node)
+    ]
+    if not visible_nodes:
+        return None
+
+    link = None
+    for node in visible_nodes:
+        node_link = _closest_normal_link(node)
+        if node_link is None:
+            return None
+        if link is None:
+            link = node_link
+        elif link is not node_link:
+            return None
+    return link
+
+
+def _clear_visible_text_except(block, keep_node=None, keep_link=None) -> None:
+    for node in list(block.find_all(string=True)):
+        if not _is_visible_text_node(node):
+            continue
+        if keep_node is not None and node is keep_node:
+            continue
+        if keep_link is not None and _closest_normal_link(node) is keep_link:
+            continue
+        node.replace_with("")
 
 
 def _replace_block_text_preserving_links(block, translated_text: str) -> None:
-    link_text_node = None
-    for node in block.find_all(string=True):
-        if _normal_link_text_node(node):
-            link_text_node = node
-            break
-
-    if link_text_node is not None:
-        link = link_text_node.parent
+    link = _single_normal_link_for_visible_text(block)
+    if link is not None:
         link.clear()
         link.append(translated_text)
-        for node in list(block.find_all(string=True)):
-            if not _is_visible_text_node(node):
-                continue
-            if node.parent is link:
-                continue
-            node.replace_with("")
         return
 
     first_text_node = None
@@ -763,8 +807,10 @@ def _replace_block_text_preserving_links(block, translated_text: str) -> None:
             node.replace_with("")
 
     if first_text_node is not None:
+        _clear_visible_text_except(block, keep_node=first_text_node)
         first_text_node.replace_with(translated_text)
     else:
+        _clear_visible_text_except(block)
         block.insert(0, translated_text)
 
 
