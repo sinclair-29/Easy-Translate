@@ -36,36 +36,168 @@ DASH_TRANSLATION = str.maketrans(
 )
 
 STOPWORDS = {
+    "a",
     "about",
     "after",
     "again",
     "against",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
     "also",
+    "be",
+    "been",
+    "being",
     "because",
     "before",
     "between",
+    "both",
+    "but",
+    "by",
+    "can",
     "could",
+    "did",
+    "do",
+    "does",
+    "done",
     "during",
+    "each",
+    "either",
+    "else",
+    "even",
+    "ever",
+    "every",
     "first",
+    "for",
     "from",
+    "had",
+    "has",
     "have",
+    "he",
+    "her",
+    "hers",
+    "him",
+    "his",
+    "how",
+    "i",
+    "i'd",
+    "i'll",
+    "i'm",
+    "i've",
+    "if",
     "into",
+    "is",
+    "it",
+    "it's",
+    "its",
+    "me",
+    "my",
+    "no",
+    "nor",
+    "not",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
     "other",
+    "our",
+    "out",
     "over",
+    "same",
+    "she",
+    "so",
+    "some",
     "should",
     "such",
+    "than",
+    "that",
+    "that's",
+    "the",
     "their",
+    "them",
+    "then",
     "there",
+    "there's",
     "these",
     "they",
     "this",
     "those",
     "through",
+    "to",
+    "too",
     "under",
+    "up",
+    "us",
+    "was",
+    "we",
+    "well",
+    "were",
+    "what",
+    "what's",
+    "when",
+    "where",
     "which",
+    "who",
+    "who's",
+    "whom",
+    "whose",
+    "why",
     "while",
     "with",
     "would",
+    "yes",
+    "you",
+    "you'd",
+    "you'll",
+    "you're",
+    "you've",
+    "your",
+    "yours",
+}
+GENERIC_TERMS = {
+    "book",
+    "door",
+    "end",
+    "family",
+    "friend",
+    "girl",
+    "going",
+    "hall",
+    "home",
+    "house",
+    "know",
+    "last",
+    "letter",
+    "man",
+    "men",
+    "more",
+    "one",
+    "people",
+    "police",
+    "room",
+    "rooms",
+    "said",
+    "say",
+    "says",
+    "see",
+    "still",
+    "tell",
+    "tells",
+    "thing",
+    "things",
+    "think",
+    "time",
+    "two",
+    "way",
+    "wife",
+    "woman",
 }
 
 PRIORITY_KINDS = {"heading", "toc", "metadata", "caption"}
@@ -94,6 +226,7 @@ def _clean_candidate(text: str) -> str:
 
 def _normalize_key(text: str) -> str:
     text = _clean_candidate(text).casefold()
+    text = text.replace("’", "'").replace("‘", "'")
     text = re.sub(r"[._/]+", " ", text)
     text = re.sub(r"\s*-\s*", "-", text)
     text = re.sub(r"[^\w\s'’-]+", " ", text)
@@ -104,6 +237,8 @@ def _normalize_key(text: str) -> str:
 
 def _singularize_word(word: str) -> str:
     if len(word) <= 4:
+        return word
+    if "'" in word or "’" in word:
         return word
     if word.endswith("ies"):
         return word[:-3] + "y"
@@ -120,6 +255,37 @@ def _variant_keys(text: str):
         return set()
     variants = {key, key.replace("-", " "), key.replace(" ", "-")}
     return {variant for variant in variants if variant}
+
+
+def _source_words(text: str) -> List[str]:
+    return [
+        _singularize_word(word)
+        for word in _normalize_key(text).split()
+        if word
+    ]
+
+
+def _has_name_like_shape(text: str) -> bool:
+    text = _clean_candidate(text)
+    if not text:
+        return False
+    words = [word for word in re.split(r"[\s/-]+", text) if word]
+    if any(word.isupper() and len(word) > 1 for word in words):
+        return True
+    if any(any(ord(ch) > 127 for ch in word) for word in words):
+        return True
+    capitalized_words = [
+        word for word in words if word[:1].isupper() and _normalize_key(word) not in STOPWORDS
+    ]
+    return len(capitalized_words) >= 1
+
+
+def _is_generic_phrase(text: str) -> bool:
+    words = _source_words(text)
+    if not words:
+        return True
+    generic_words = STOPWORDS | GENERIC_TERMS
+    return all(word in generic_words for word in words)
 
 
 def _normalized_contains(haystack: str, needle: str) -> bool:
@@ -166,18 +332,38 @@ def _is_candidate_allowed(candidate: str) -> bool:
         return False
     if PUNCTUATION_ONLY_RE.match(candidate):
         return False
-    if candidate.lower() in STOPWORDS:
+    if _normalize_key(candidate) in STOPWORDS:
         return False
     if candidate.isdigit():
         return False
     if not any(character.isalpha() for character in candidate):
         return False
-    words = candidate.split()
-    if len(words) == 1 and words[0].lower() in STOPWORDS:
+    words = _source_words(candidate)
+    if len(words) == 1 and words[0] in STOPWORDS:
         return False
-    if len(words) == 1 and len(words[0]) <= 2 and not words[0].isupper():
+    if len(words) == 1 and len(words[0]) <= 2 and not candidate.isupper():
+        return False
+    if _is_generic_phrase(candidate):
         return False
     return True
+
+
+def _is_terminology_entry_allowed(source: str, target: str) -> bool:
+    if not source or not target or not _is_candidate_allowed(source):
+        return False
+    words = _source_words(source)
+    if not words:
+        return False
+    if len(words) == 1:
+        return _has_name_like_shape(source) or source.isupper()
+    name_like = _has_name_like_shape(source)
+    if name_like:
+        return True
+    if "·" in target and not any(word in STOPWORDS for word in words):
+        return True
+    if any(word in STOPWORDS for word in words):
+        return False
+    return not _is_generic_phrase(source)
 
 
 def _metadata_kind(unit_metadata: Optional[List[dict]], index: int) -> str:
@@ -223,6 +409,11 @@ def _iter_repeated_phrase_candidates(line: str) -> Iterable[str]:
             if phrase_words[0] in STOPWORDS or phrase_words[-1] in STOPWORDS:
                 continue
             if sum(word in STOPWORDS for word in phrase_words) > 1:
+                continue
+            if all(
+                _singularize_word(word) in STOPWORDS | GENERIC_TERMS
+                for word in phrase_words
+            ):
                 continue
             phrases.append(" ".join(phrase_words))
     return phrases
@@ -319,6 +510,9 @@ def build_terminology_prompt(
     base = (
         f"Prepare a compact terminology memory for translating a book into {target_language}.\n"
         "Choose only useful recurring names, proper nouns, acronyms, and domain terms.\n"
+        "Prefer named entities: people, families, places, organizations, publishers, works, and distinctive concepts.\n"
+        "Do not include pronouns, determiners, conjunctions, auxiliary verbs, generic everyday words, or ordinary grammar phrases.\n"
+        "Bad entries include words or phrases like you, she, but, had been, and the, was the, the house, did you, or what was.\n"
         "Do not invent source terms that are not in the candidates.\n"
         "Choose one stable target translation for each entity and keep it consistent.\n"
         "For people, families, places, publishers, and organizations, include useful short variants "
@@ -400,7 +594,7 @@ def _parse_object_entries_fallback(text: str, limit: int) -> dict:
             continue
         source = str(entry.get("source", "")).strip()
         target = str(entry.get("target", "")).strip()
-        if not source or not target:
+        if not _is_terminology_entry_allowed(source, target):
             continue
         key = _normalize_key(source)
         if not key or key in seen:
@@ -432,7 +626,7 @@ def _normalize_entries(entries, limit: int) -> List[dict]:
         else:
             continue
 
-        if not source or not target:
+        if not _is_terminology_entry_allowed(source, target):
             continue
         normalized.append({"source": source, "target": target})
         if len(normalized) >= limit:

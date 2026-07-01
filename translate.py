@@ -767,7 +767,7 @@ def main(
             "repetition_penalty": repetition_penalty,
             "keep_special_tokens": keep_special_tokens,
             "keep_tokenization_spaces": keep_tokenization_spaces,
-            "terminology_consistency_version": 2,
+            "terminology_consistency_version": 3,
         }
         resume_meta = build_resume_meta(source_lines, resume_settings)
         if disable_resume:
