@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from typing import Dict, List, Optional
 
 import torch
@@ -39,6 +40,178 @@ from terminology import (
 
 def encode_string(text):
     return text.replace("\r", r"\r").replace("\n", r"\n").replace("\t", r"\t")
+
+
+PROMPT_LEAK_MARKERS = (
+    "requirements:",
+    "preserve all information",
+    "do not summarize",
+    "do not explain",
+    "do not omit content",
+    "document context for consistency only",
+    "context for consistency only",
+    "terminology memory for consistency",
+    "locked terminology for consistency",
+    "保留所有信息",
+    "不要总结",
+    "不要解释",
+    "不要遗漏内容",
+    "仅用于保持一致性的文档背景",
+    "仅用于保持一致性的上下文",
+    "用于保持一致性的术语记忆",
+    "锁定术语",
+    "块类型：",
+    "块类型:",
+)
+
+
+def _translation_contains_prompt_leak(text: str) -> bool:
+    probe = (text or "").replace(r"\n", "\n").replace(r"\r", "\n")
+    lower_probe = probe.lower()
+    return any(marker in lower_probe for marker in PROMPT_LEAK_MARKERS)
+
+
+def clean_translation_output(text: str) -> str:
+    """Remove accidental prompt/control text echoed by chat models."""
+    text = (text or "").strip()
+    if not text or not _translation_contains_prompt_leak(text):
+        return text
+
+    working = (
+        text.replace(r"\r", "\n")
+        .replace(r"\n", "\n")
+        .replace(r"\t", " ")
+    )
+    cleaned_lines = []
+    skip_section = None
+
+    for raw_line in working.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower_line = line.lower()
+        normalized_header = lower_line.rstrip(":：")
+
+        if lower_line.startswith("translate the following text into") or lower_line.startswith(
+            "将以下文本翻译成"
+        ):
+            skip_section = None
+            continue
+
+        if normalized_header in {"requirements", "要求"}:
+            skip_section = "requirements"
+            continue
+
+        if (
+            "document context for consistency only" in lower_line
+            or "仅用于保持一致性的文档背景" in line
+        ):
+            skip_section = "document_context"
+            continue
+
+        if (
+            "context for consistency only" in lower_line
+            or "仅用于保持一致性的上下文" in line
+        ):
+            skip_section = "context"
+            continue
+
+        if (
+            "terminology memory for consistency" in lower_line
+            or "locked terminology for consistency" in lower_line
+            or "用于保持一致性的术语记忆" in line
+            or "锁定术语" in line
+        ):
+            skip_section = "terminology"
+            continue
+
+        if normalized_header in {"text", "文本", "translation", "译文"}:
+            skip_section = None
+            continue
+
+        if skip_section == "requirements":
+            if line.startswith(("-", "－", "—", "*", "•")) or any(
+                phrase in lower_line
+                for phrase in (
+                    "preserve all information",
+                    "do not summarize",
+                    "do not explain",
+                    "do not omit content",
+                    "preserve names",
+                    "maintain paragraph",
+                    "produce natural",
+                    "numbered items",
+                )
+            ) or any(
+                phrase in line
+                for phrase in (
+                    "保留所有信息",
+                    "不要总结",
+                    "不要解释",
+                    "不要遗漏内容",
+                    "保留名称",
+                    "保留姓名",
+                    "保持段落",
+                    "自然流畅",
+                    "编号项目",
+                    "相同的项目编号",
+                )
+            ):
+                continue
+            skip_section = None
+
+        if skip_section == "document_context":
+            if (
+                lower_line.startswith(("book:", "chapter:", "epub item:", "block kind:"))
+                or line.startswith(("书名：", "书名:", "章节：", "章节:", "EPUB 项目：", "EPUB项目：", "块类型：", "块类型:"))
+            ):
+                continue
+            skip_section = None
+
+        if skip_section == "context":
+            if lower_line.startswith(("previous block", "next block")) or line.startswith(
+                ("前一块", "后一块", "上一段", "下一段")
+            ):
+                continue
+            skip_section = None
+
+        if skip_section == "terminology":
+            if line.startswith(("-", "－", "—", "*", "•")) or "=>" in line or "→" in line:
+                continue
+            skip_section = None
+
+        if any(
+            phrase in lower_line
+            for phrase in (
+                "preserve all information",
+                "do not summarize",
+                "do not explain",
+                "do not omit content",
+                "document context for consistency only",
+                "context for consistency only",
+                "terminology memory for consistency",
+                "locked terminology for consistency",
+            )
+        ) or any(
+            phrase in line
+            for phrase in (
+                "保留所有信息",
+                "不要总结",
+                "不要解释",
+                "不要遗漏内容",
+                "仅用于保持一致性的文档背景",
+                "仅用于保持一致性的上下文",
+                "用于保持一致性的术语记忆",
+                "锁定术语",
+            )
+        ):
+            continue
+
+        cleaned_lines.append(line)
+
+    cleaned = " ".join(cleaned_lines)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 def is_epub_path(path: Optional[str]) -> bool:
@@ -150,6 +323,9 @@ def load_partial_translations(
                 index = record.get("index")
                 text = record.get("text")
                 if isinstance(index, int) and 0 <= index < total_lines and isinstance(text, str):
+                    text = clean_translation_output(text)
+                    if not text:
+                        continue
                     if translations[index] is None:
                         loaded += 1
                     translations[index] = text
@@ -591,6 +767,7 @@ def main(
             "repetition_penalty": repetition_penalty,
             "keep_special_tokens": keep_special_tokens,
             "keep_tokenization_spaces": keep_tokenization_spaces,
+            "terminology_consistency_version": 2,
         }
         resume_meta = build_resume_meta(source_lines, resume_settings)
         if disable_resume:
@@ -609,7 +786,10 @@ def main(
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             with open(output_path, "w", encoding="utf-8") as output_file:
                 for translated_text in translations:
-                    print(encode_string(translated_text or ""), file=output_file)
+                    print(
+                        encode_string(clean_translation_output(translated_text or "")),
+                        file=output_file,
+                    )
             accelerator.wait_for_everyone()
             print(f"Translation done. Output written to {output_path}\n")
             return
@@ -993,7 +1173,7 @@ def main(
             partial_file = open(partial_text_path, "a", encoding="utf-8")
 
         def record_translation(index: int, text: str) -> None:
-            text = text.strip()
+            text = clean_translation_output(text)
             translations[index] = text
             if partial_file is not None:
                 append_partial_translation(partial_file, index, text)
@@ -1091,7 +1271,10 @@ def main(
 
         with open(output_path, "w", encoding="utf-8") as output_file:
             for translated_text in translations:
-                print(encode_string(translated_text or ""), file=output_file)
+                print(
+                    encode_string(clean_translation_output(translated_text or "")),
+                    file=output_file,
+                )
 
         accelerator.wait_for_everyone()
         print(f"Translation done. Output written to {output_path}\n")

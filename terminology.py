@@ -5,17 +5,21 @@ from collections import Counter, defaultdict
 from typing import Dict, Iterable, List, Optional
 
 
-DEFAULT_CANDIDATE_LIMIT = 300
-DEFAULT_MEMORY_LIMIT = 150
-DEFAULT_RELEVANT_LIMIT = 20
+DEFAULT_CANDIDATE_LIMIT = 400
+DEFAULT_MEMORY_LIMIT = 200
+DEFAULT_RELEVANT_LIMIT = 35
 
 ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9&.-]{1,}\b")
+LATIN_UPPER = "A-ZÀ-ÖØ-Þ"
+LATIN_LETTER = "A-Za-zÀ-ÖØ-öø-ÿ"
 CAPITALIZED_PHRASE_RE = re.compile(
-    r"\b[A-Z][A-Za-z0-9'’.-]+"
-    r"(?:\s+(?:[A-Z][A-Za-z0-9'’.-]+|(?:of|and|the|for|in|on|to|de|la|le|van|von|da|di|du)\b)){0,5}"
+    rf"\b[{LATIN_UPPER}][{LATIN_LETTER}0-9'’.-]+"
+    rf"(?:\s+(?:[{LATIN_UPPER}][{LATIN_LETTER}0-9'’.-]+|(?:of|and|the|for|in|on|to|de|la|le|van|von|da|di|du)\b)){{0,5}}"
 )
-HYPHENATED_TERM_RE = re.compile(r"\b[A-Za-z][A-Za-z]+(?:-[A-Za-z][A-Za-z]+)+\b")
-WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]{2,}")
+HYPHENATED_TERM_RE = re.compile(
+    rf"\b[{LATIN_LETTER}][{LATIN_LETTER}]+(?:-[{LATIN_LETTER}][{LATIN_LETTER}]+)+\b"
+)
+WORD_RE = re.compile(rf"[{LATIN_LETTER}][{LATIN_LETTER}'’-]{{2,}}")
 URL_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
 URL_IN_TEXT_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 PUNCTUATION_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
@@ -65,6 +69,22 @@ STOPWORDS = {
 }
 
 PRIORITY_KINDS = {"heading", "toc", "metadata", "caption"}
+NAME_PREFIXES = {
+    "captain",
+    "dr",
+    "father",
+    "lady",
+    "lord",
+    "madame",
+    "madam",
+    "miss",
+    "mr",
+    "mrs",
+    "ms",
+    "professor",
+    "reverend",
+    "sir",
+}
 
 
 def _clean_candidate(text: str) -> str:
@@ -100,6 +120,43 @@ def _variant_keys(text: str):
         return set()
     variants = {key, key.replace("-", " "), key.replace(" ", "-")}
     return {variant for variant in variants if variant}
+
+
+def _normalized_contains(haystack: str, needle: str) -> bool:
+    if not haystack or not needle:
+        return False
+    return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", haystack) is not None
+
+
+def _source_match_keys(source: str):
+    variants = set(_variant_keys(source))
+    cleaned = _clean_candidate(source)
+    parts = [
+        _clean_candidate(part)
+        for part in re.split(r"[\s/-]+", cleaned)
+        if _clean_candidate(part)
+    ]
+    for part in parts:
+        key = _normalize_key(part)
+        if (
+            key
+            and key not in STOPWORDS
+            and key not in NAME_PREFIXES
+            and _is_candidate_allowed(part)
+            and (part[:1].isupper() or part.isupper())
+        ):
+            variants.update(_variant_keys(part))
+
+    if len(parts) > 1:
+        tail_parts = [
+            part
+            for part in parts
+            if _normalize_key(part) not in STOPWORDS
+            and _normalize_key(part) not in NAME_PREFIXES
+        ]
+        if tail_parts:
+            variants.update(_variant_keys(tail_parts[-1]))
+    return variants
 
 
 def _is_candidate_allowed(candidate: str) -> bool:
@@ -263,6 +320,10 @@ def build_terminology_prompt(
         f"Prepare a compact terminology memory for translating a book into {target_language}.\n"
         "Choose only useful recurring names, proper nouns, acronyms, and domain terms.\n"
         "Do not invent source terms that are not in the candidates.\n"
+        "Choose one stable target translation for each entity and keep it consistent.\n"
+        "For people, families, places, publishers, and organizations, include useful short variants "
+        "or surnames as separate entries when they recur or may appear alone.\n"
+        "For names with accents or diacritics, treat them as the same recurring proper name instead of dropping them.\n"
         "Keep target translations concise and consistent.\n"
         f"Return at most {memory_limit} total entries.\n\n"
         "Return valid JSON with exactly this shape:\n"
@@ -379,25 +440,69 @@ def _normalize_entries(entries, limit: int) -> List[dict]:
     return normalized
 
 
+def _infer_short_name_aliases(memory: dict, limit: int) -> dict:
+    proper_names = list(memory.get("proper_names", []) or [])
+    terms = list(memory.get("terms", []) or [])
+    seen = {
+        _normalize_key(entry.get("source", ""))
+        for entry in proper_names + terms
+        if isinstance(entry, dict)
+    }
+    total = len(proper_names) + len(terms)
+
+    for entry in list(proper_names):
+        if total >= limit:
+            break
+        source = str(entry.get("source", "")).strip()
+        target = str(entry.get("target", "")).strip()
+        source_parts = [
+            _clean_candidate(part)
+            for part in re.split(r"[\s/-]+", source)
+            if _clean_candidate(part)
+        ]
+        if len(source_parts) < 2 or "·" not in target:
+            continue
+        alias_source = source_parts[-1]
+        alias_key = _normalize_key(alias_source)
+        alias_target = target.rsplit("·", 1)[-1].strip()
+        if (
+            not alias_key
+            or alias_key in seen
+            or alias_key in STOPWORDS
+            or alias_key in NAME_PREFIXES
+            or not alias_target
+            or not _is_candidate_allowed(alias_source)
+        ):
+            continue
+        proper_names.append({"source": alias_source, "target": alias_target})
+        seen.add(alias_key)
+        total += 1
+
+    return {"terms": terms, "proper_names": proper_names}
+
+
 def parse_terminology_memory(text: str, limit: int = DEFAULT_MEMORY_LIMIT) -> dict:
     try:
         payload = _extract_json_object(text)
     except (ValueError, json.JSONDecodeError) as error:
         fallback_memory = _parse_object_entries_fallback(text, limit)
         if fallback_memory["terms"] or fallback_memory["proper_names"]:
-            return fallback_memory
+            return _infer_short_name_aliases(fallback_memory, limit)
         raise error
 
     if not isinstance(payload, dict):
         fallback_memory = _parse_object_entries_fallback(text, limit)
         if fallback_memory["terms"] or fallback_memory["proper_names"]:
-            return fallback_memory
+            return _infer_short_name_aliases(fallback_memory, limit)
         raise ValueError("Terminology response JSON must be an object.")
 
     proper_names = _normalize_entries(payload.get("proper_names", []), limit)
     remaining = max(0, limit - len(proper_names))
     terms = _normalize_entries(payload.get("terms", []), remaining)
-    return {"terms": terms, "proper_names": proper_names}
+    return _infer_short_name_aliases(
+        {"terms": terms, "proper_names": proper_names},
+        limit,
+    )
 
 
 def save_terminology_memory(memory: dict, path: str) -> None:
@@ -438,7 +543,7 @@ def select_relevant_terms(
         key = _normalize_key(source)
         if not key or key in seen:
             continue
-        if any(variant in haystack for variant in _variant_keys(source)):
+        if any(_normalized_contains(haystack, variant) for variant in _source_match_keys(source)):
             seen.add(key)
             relevant.append(entry)
 
@@ -451,7 +556,7 @@ def format_terminology_section(entries: List[dict]) -> str:
         return ""
 
     lines = [
-        "Terminology memory for consistency. Use these entries when they fit the text; do not force them where they do not fit:",
+        "Locked terminology for consistency. If any source term below appears in the Text section, you MUST use exactly the target translation shown. Do not invent alternative transliterations or mix variants:",
     ]
     for entry in entries:
         lines.append(f"- {entry['source']} => {entry['target']}")

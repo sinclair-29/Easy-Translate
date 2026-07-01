@@ -13,6 +13,8 @@ Requirements:
 - Do not explain.
 - Do not omit content.
 - Preserve names, references, citations, and technical terminology.
+- Strictly follow any locked terminology provided below; never use alternative
+  transliterations for those source terms.
 - Maintain paragraph structure whenever possible.
 - Produce natural and readable {TARGET_LANGUAGE}.
 - If the text contains numbered items, return exactly the same item numbers in the same order.

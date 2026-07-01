@@ -498,6 +498,13 @@ def _is_numeric_text(text: str) -> bool:
     return bool(re.fullmatch(r"[\[\(]?\d{1,4}[\]\)]?\.?", _normalize_text(text)))
 
 
+def _is_note_marker_text(text: str) -> bool:
+    text = _normalize_text(text).lower()
+    return _is_numeric_text(text) or bool(
+        re.fullmatch(r"(?:fn|note|footnote|endnote)[-_ ]?\d{1,5}\.?", text)
+    )
+
+
 def _tag_classes(tag) -> set:
     classes = tag.get("class") or []
     if isinstance(classes, str):
@@ -518,7 +525,7 @@ def _is_noteref_link(tag) -> bool:
     if tag is None or _local_tag_name(tag) != "a":
         return False
     text = _normalize_text(tag.get_text("", strip=True))
-    if not _is_numeric_text(text):
+    if not _is_note_marker_text(text):
         return False
     classes = _tag_classes(tag)
     epub_types = _epub_type_values(tag)
@@ -539,6 +546,7 @@ def _is_noteref_link(tag) -> bool:
         or "footnote" in epub_types
         or "endnote" in epub_types
         or ("#" in href and any(hint in link_context for hint in NOTE_HINTS))
+        or ("#" in href and not _is_numeric_text(text))
         or bool(re.fullmatch(r"(?:n|fn|note|footnote|endnote)[-_]?\d{1,5}", fragment))
     )
 
@@ -547,7 +555,7 @@ def _is_backlink_note_link(tag) -> bool:
     if tag is None or _local_tag_name(tag) != "a":
         return False
     text = _normalize_text(tag.get_text("", strip=True))
-    if not _is_numeric_text(text):
+    if not _is_note_marker_text(text):
         return False
     classes = _tag_classes(tag)
     href = str(tag.get("href", "")).lower()
@@ -578,7 +586,7 @@ def _is_structural_note_link(tag) -> bool:
     if tag is None or _local_tag_name(tag) != "a":
         return False
     text = _normalize_text(tag.get_text("", strip=True))
-    if not _is_numeric_text(text):
+    if not _is_note_marker_text(text):
         return False
     if (
         _is_noteref_link(tag)
@@ -774,6 +782,63 @@ def _single_normal_link_for_visible_text(block):
     return link
 
 
+def _normal_links_with_text(block) -> List:
+    links = []
+    for link in block.find_all("a"):
+        if _is_structural_note_link(link):
+            continue
+        text = _normalize_text(link.get_text(" ", strip=True))
+        if text:
+            links.append(link)
+    return links
+
+
+def _first_visible_text_node_outside_links(block):
+    fallback = None
+    for node in block.find_all(string=True):
+        if not _is_visible_text_node(node):
+            continue
+        if fallback is None:
+            fallback = node
+        if _closest_normal_link(node) is None:
+            return node
+    return fallback
+
+
+def _replace_text_with_inline_links(block, translated_text: str, links: List) -> bool:
+    if not links:
+        return False
+
+    pieces = []
+    position = 0
+    for link in links:
+        link_text = _normalize_text(link.get_text(" ", strip=True))
+        if not link_text:
+            return False
+        found = translated_text.find(link_text, position)
+        if found < 0:
+            return False
+        if found > position:
+            pieces.append(translated_text[position:found])
+        link.extract()
+        link.clear()
+        link.append(link_text)
+        pieces.append(link)
+        position = found + len(link_text)
+
+    if position < len(translated_text):
+        pieces.append(translated_text[position:])
+
+    target_node = _first_visible_text_node_outside_links(block)
+    _clear_visible_text_except(block, keep_node=target_node)
+    if target_node is not None:
+        target_node.replace_with(*pieces)
+    else:
+        for piece in reversed(pieces):
+            block.insert(0, piece)
+    return True
+
+
 def _clear_visible_text_except(block, keep_node=None, keep_link=None) -> None:
     for node in list(block.find_all(string=True)):
         if not _is_visible_text_node(node):
@@ -790,6 +855,13 @@ def _replace_block_text_preserving_links(block, translated_text: str) -> None:
     if link is not None:
         link.clear()
         link.append(translated_text)
+        return
+
+    if _replace_text_with_inline_links(
+        block,
+        translated_text,
+        _normal_links_with_text(block),
+    ):
         return
 
     first_text_node = None
