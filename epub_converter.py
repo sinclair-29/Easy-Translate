@@ -699,12 +699,20 @@ def _noteref_text_segments(block) -> List[Dict]:
     return segments
 
 
+def _translatable_noteref_text_segments(block) -> List[Dict]:
+    return [
+        segment
+        for segment in _noteref_text_segments(block)
+        if split_translation_units(segment["text"])
+    ]
+
+
 def _replace_noteref_segmented_block(
     block,
     block_info: Dict,
     translated_lines: List[str],
 ) -> None:
-    segments = _noteref_text_segments(block)
+    segments = _translatable_noteref_text_segments(block)
     segment_infos = block_info.get("segments", [])
     if len(segments) != len(segment_infos):
         raise ValueError(
@@ -925,10 +933,8 @@ def epub_to_text(epub_path: str, text_path: str, manifest_path: str) -> None:
             kind = _infer_block_kind(block, item)
             if unit_mode == "block" and _has_noteref_descendant(block):
                 segment_infos = []
-                for segment in _noteref_text_segments(block):
+                for segment in _translatable_noteref_text_segments(block):
                     text_lines = split_translation_units(segment["text"])
-                    if not text_lines:
-                        continue
                     segment_infos.append(
                         {
                             "line": len(lines),

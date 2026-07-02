@@ -98,6 +98,40 @@ class LinkPreservingReplacement(unittest.TestCase):
         self.assertLess(rebuilt.index("第二处论断"), rebuilt.index(">2<"))
         self.assertLess(rebuilt.index(">2<"), rebuilt.index("尾部文字。"))
 
+    def test_noteref_segment_replacement_ignores_untranslated_segments(self):
+        soup = epub_converter.BeautifulSoup(
+            '<p>Text before note<a class="noteref" epub:type="noteref" '
+            'href="notes.xhtml#n1">1</a> --</p>',
+            "html.parser",
+        )
+        block = soup.find("p")
+        self.assertEqual(len(epub_converter._noteref_text_segments(block)), 2)
+        self.assertEqual(
+            [
+                segment["text"]
+                for segment in epub_converter._translatable_noteref_text_segments(block)
+            ],
+            ["Text before note"],
+        )
+
+        block_info = {
+            "block_index": 0,
+            "segments": [
+                {"line": 0, "lines": 1},
+            ],
+        }
+
+        epub_converter._replace_noteref_segmented_block(
+            block,
+            block_info,
+            ["脚注前文本"],
+        )
+
+        rebuilt = str(block)
+        self.assertIn("脚注前文本", rebuilt)
+        self.assertIn(">1<", rebuilt)
+        self.assertIn("--", rebuilt)
+
     def test_backlink_number_is_structural_not_translatable_text(self):
         soup = epub_converter.BeautifulSoup(
             '<p><a class="backlink" href="chapter.xhtml#note7">7.</a> '
